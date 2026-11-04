@@ -11,6 +11,7 @@ import net.runelite.client.plugins.microbot.util.antiban.enums.ActivityIntensity
 import net.runelite.client.plugins.microbot.util.math.Rs2Random;
 import net.runelite.client.plugins.microbot.util.mouse.naturalmouse.api.MouseInfoAccessor;
 import net.runelite.client.plugins.microbot.util.mouse.naturalmouse.api.MouseMotionFactory;
+import net.runelite.client.plugins.microbot.util.mouse.naturalmouse.api.SpeedManager;
 import net.runelite.client.plugins.microbot.util.mouse.naturalmouse.api.SystemCalls;
 import net.runelite.client.plugins.microbot.util.mouse.naturalmouse.support.DefaultMouseMotionNature;
 import net.runelite.client.plugins.microbot.util.mouse.naturalmouse.support.DefaultSpeedManager;
@@ -51,6 +52,72 @@ public class NaturalMouse {
 
     private volatile MouseMotionFactory cachedFactory;
     private volatile ActivityIntensity cachedIntensity;
+
+    // ===================== [MICROBOT 本地改动] 鼠标移动速度覆盖 =====================
+    // 本地新增：允许外部直接指定一次移动要花多久，不受 ActivityIntensity 影响。
+    //
+    // 为什么要这个：
+    // 上游把「移动快慢」和「轨迹形状」绑在同一个 ActivityIntensity 档位上 ——
+    // 换档位会同时换掉轨迹模板（匀速/变速/慢启动/抖动）和移动耗时。
+    // 而 ActivityIntensity 还被 antiban 拿去决定行为强度（PASSIVE ~ EXTREME_AGGRESSIVE），
+    // 想单独调鼠标速度就只能连 antiban 一起改。
+    //
+    // 这里只覆盖耗时，形状和 antiban 的强度都不动。
+    //
+    // null 表示不覆盖，走档位自己的耗时。
+    //
+    // 覆盖值在每次 getFactory() 时重新应用 —— 因为换档位会重建 factory，
+    // 新的 factory 自带一个默认耗时的 SpeedManager，不重新应用就会把设置丢掉。
+    //
+    // 冲突时如何覆盖：保留这个字段和下面两个方法。
+    // ===================== [MICROBOT 本地改动 END] =====================
+    private volatile Long movementTimeOverrideMs;
+
+    /**
+     * 覆盖鼠标移动耗时。传 null 表示取消覆盖，跟随当前的 ActivityIntensity 档位。
+     *
+     * @param movementTimeMs 一次移动的基准耗时（毫秒），实际耗时是这个值到两倍之间的随机数
+     */
+    public void setMovementTimeOverrideMs(Long movementTimeMs) {
+        this.movementTimeOverrideMs = movementTimeMs;
+
+        // 取消覆盖时把缓存的 factory 丢掉：覆盖是直接改在 factory 的 SpeedManager 上的，
+        // 光把覆盖值清空，SpeedManager 里留着上一次写的耗时就回不去了。
+        // 丢掉缓存之后，下次 getFactory() 会按当前档位重建一个，耗时自然是档位自己的。
+        //
+        // 换档位本来也会重建 factory，所以覆盖开着的时候不用担心残留 ——
+        // 新 factory 建好后 applyMovementTimeOverride 会重新写一遍覆盖值。
+        if (movementTimeMs == null) {
+            cachedFactory = null;
+        }
+    }
+
+    /**
+     * 当前生效的移动耗时覆盖值。
+     *
+     * @return 覆盖值，null 表示没覆盖
+     */
+    public Long getMovementTimeOverrideMs() {
+        return movementTimeOverrideMs;
+    }
+
+    /**
+     * 把覆盖的耗时应用到 factory 上。
+     *
+     * <p>只有 {@link DefaultSpeedManager} 支持改耗时，其它 SpeedManager 实现（比如
+     * 按距离线性算时间的那个）跳过。
+     */
+    private void applyMovementTimeOverride(MouseMotionFactory factory) {
+        Long override = movementTimeOverrideMs;
+        if (override == null || factory == null) {
+            return;
+        }
+
+        SpeedManager speedManager = factory.getSpeedManager();
+        if (speedManager instanceof DefaultSpeedManager) {
+            ((DefaultSpeedManager) speedManager).setMouseMovementBaseTimeMs(override);
+        }
+    }
 
     @Inject
     public NaturalMouse() {
@@ -93,6 +160,10 @@ public class NaturalMouse {
     public MouseMotionFactory getFactory() {
         ActivityIntensity intensity = Rs2Antiban.getActivityIntensity();
         if (cachedFactory != null && intensity == cachedIntensity) {
+            // ===================== [MICROBOT 本地改动] 鼠标移动速度覆盖 =====================
+            // 缓存命中时也要重新应用 —— 覆盖值可能在 factory 建好之后才被改过。
+            // ===================== [MICROBOT 本地改动 END] =====================
+            applyMovementTimeOverride(cachedFactory);
             return cachedFactory;
         }
         MouseMotionFactory factory;
@@ -117,6 +188,10 @@ public class NaturalMouse {
         }
         cachedIntensity = intensity;
         cachedFactory = factory;
+        // ===================== [MICROBOT 本地改动] 鼠标移动速度覆盖 =====================
+        // 新建的 factory 自带一个默认耗时的 SpeedManager，不覆盖的话设置就丢了。
+        // ===================== [MICROBOT 本地改动 END] =====================
+        applyMovementTimeOverride(factory);
         return factory;
 
 //		var factory = new MouseMotionFactory();

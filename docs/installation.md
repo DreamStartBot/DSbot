@@ -14,6 +14,80 @@ Install Java 17+ and run the shaded jar:
 java -jar client-<version>-SNAPSHOT-shaded.jar
 ```
 
+## Proxy
+
+The client routes both the game connection and its HTTP traffic through a SOCKS5 proxy. Configure it at launch:
+
+```bash
+java -jar client-<version>-SNAPSHOT-shaded.jar --proxy-type socks5 --proxy-host 1.2.3.4 --proxy-port 1080 --proxy-user user --proxy-pass pass
+```
+
+| Option | Meaning |
+|---|---|
+| `--proxy-type` | `socks` or `socks5`. Defaults to `socks5` when omitted. HTTP(S) proxies are refused. |
+| `--proxy-host` | Proxy host or IP. Required. |
+| `--proxy-port` | Proxy port. Required. |
+| `--proxy-user` | Optional username. |
+| `--proxy-pass` | Optional password. |
+
+These options do not go through URI parsing, so a password may contain `@`, `#`, `:` or `/` without URL encoding.
+
+The older single-option form still works, and is used whenever `--proxy-host` is absent:
+
+```bash
+java -jar client-<version>-SNAPSHOT-shaded.jar --proxy=socks://user:pass@1.2.3.4:1080
+```
+
+A URI password that contains `@` or `#` must be URL-encoded.
+
+On start the client fetches the external IP through the proxy. If it cannot be detected, startup stops instead of falling back to a direct connection, and the client shows `Proxy enabled (IP x.x.x.x)` in the Microbot panel.
+
+A proxy is fixed for the lifetime of the process. The option is read at start, so changing it requires a restart.
+
+## Jagex Session Login
+
+The client can log in with a Jagex session id and character id directly, without the Jagex Launcher, the OAuth flow or the interactive character picker:
+
+```bash
+java -jar client-<version>-SNAPSHOT-shaded.jar --session-id <session id> --character-id <character id>
+```
+
+| Option | Meaning |
+|---|---|
+| `--session-id` | The Jagex session id. Required. |
+| `--character-id` | The character id to log in with. |
+| `--display-name` | The character name. Optional. |
+
+The credentials are injected into the game client during startup, so the login screen shows that character's login button. The login itself is not submitted for you; press the button or Enter.
+
+The character name is only needed by the client, not by the login. When `--display-name` is omitted, the character list is read from `https://auth.jagex.com/game-session/v1/accounts` with the session id and matched against the character id, which costs one request at startup. Passing the display name skips that request. If the character id does not match, the client logs the characters the account does have.
+
+`--character-id` is not the same as the upstream `--character` option. `--character` matches a character name against the sessions stored on this machine, while `--session-id` uses the credentials given on the command line. When both are given, `--session-id` wins.
+
+A session id is a short lived credential. Microbot does not store the refresh token, so an expired session id cannot be renewed and has to be obtained again.
+
+The session id appears in the process command line. On a shared machine, other local users can read it from the process list, so treat it like a password.
+
+## Window Title
+
+The client window title can be overridden at launch. This is useful when several clients run side by side and you need to tell them apart:
+
+```bash
+java -jar client-<version>-SNAPSHOT-shaded.jar --index 12
+```
+
+| Option | Meaning |
+|---|---|
+| `--index` | The final window title. Optional, must have a value. |
+
+The value is used as-is: no template substitution, no index mapping, no truncation. `Account 1` becomes the title `Account 1`.
+
+The title is applied once the game engine has started, not when the window first appears, so a failed game load does not leave a misleading title. If the engine does not start within 60 seconds, the option is dropped and the default title is kept.
+
+While the override is in effect the title is no longer combined with the player name, and changing any client setting does not reset it.
+
+**Known issue:** Microbot's break handler captures the current window title when it starts and puts its own suffix on it while resting. Depending on the timing it may end up as `12 - Break: 00:30`, and the title may fall back to the default when the break ends.
+
 ## Jagex Account Flow
 
 1. Log in with the Jagex Launcher once. This creates the account token used by RuneLite-compatible clients.

@@ -92,6 +92,7 @@ import net.runelite.client.proxy.ProxyConfiguration;
 import net.runelite.client.rs.ClientLoader;
 import net.runelite.client.rs.auth.Account;
 import net.runelite.client.rs.auth.JagexAuthService;
+import net.runelite.client.rs.auth.JagexSessionInjector;
 import net.runelite.client.rs.auth.Session;
 import net.runelite.client.ui.ClientUI;
 import net.runelite.client.ui.FatalErrorDialog;
@@ -214,6 +215,27 @@ public class RuneLite
 	@Inject
 	private JagexAuthService jagexAuthService;
 
+	// ===================== [MICROBOT 本地改动] Jagex 会话注入 =====================
+	// 命令行传入的 Jagex 凭据，用于直接注入游戏客户端，跳过 OAuth / Launcher 登录流程。
+	@Inject
+	@Named("jagexSessionId")
+	@Nullable
+	private String jagexSessionId;
+
+	@Inject
+	@Named("jagexCharacterId")
+	@Nullable
+	private String jagexCharacterId;
+
+	@Inject
+	@Named("jagexDisplayName")
+	@Nullable
+	private String jagexDisplayName;
+
+	@Inject
+	private JagexSessionInjector jagexSessionInjector;
+	// ===================== [MICROBOT 本地改动 END] =====================
+
 	public static void main(String[] args) throws Exception {
         validateJavaVersion();
         Locale.setDefault(Locale.ENGLISH);
@@ -229,13 +251,74 @@ public class RuneLite
 			.defaultsTo(RuneLiteProperties.getJavConfig());
 		parser.accepts("disable-telemetry", "Disable telemetry");
         parser.accepts("disable-walker-update", "Disable updates for the static walker");
-		parser.accepts("profile", "Configuration profile to use").withRequiredArg();
-		parser.accepts("character", "Character name to use").withRequiredArg();
+        parser.accepts("profile", "Configuration profile to use").withRequiredArg();
+        parser.accepts("character", "Character name to use").withRequiredArg();
+        // ===================== [MICROBOT 本地改动] Jagex 会话注入 =====================
+        // 本地新增：直接用 Jagex 的 session id + character id 登录，不走 OAuth / Launcher 流程。
+        // 启动后客户端登录界面会直接出现该角色的登录按钮（按回车即可登录）。
+        //   --session-id     必填，Jagex 的 session id
+        //   --character-id   角色 id（character id）
+        //   --display-name   角色名；给了它就不必再联网查角色列表（推荐，避免启动时的额外 HTTP 请求）
+        // 若未提供 --display-name，客户端会用 session id 请求
+        // https://auth.jagex.com/game-session/v1/accounts 拉取角色列表，按 character id 匹配角色名。
+        // 注意：session id 是短时效凭据（天级），过期后需要重新获取，且 microbot 不保存 refresh token，无法自动续期。
+        // 上游更新后若此处冲突，保留本段即可。
+        // ===================== [MICROBOT 本地改动 END] =====================
+        final ArgumentAcceptingOptionSpec<String> jagexSessionId = parser.accepts("session-id", "Jagex session id for direct account login. 本地新增。").withRequiredArg().ofType(String.class);
+        final ArgumentAcceptingOptionSpec<String> jagexCharacterId = parser.accepts("character-id", "Jagex character id to log in with. 本地新增。").withRequiredArg().ofType(String.class);
+        final ArgumentAcceptingOptionSpec<String> jagexDisplayName = parser.accepts("display-name", "Jagex character display name. 本地新增。").withRequiredArg().ofType(String.class);
+		// ===================== [MICROBOT 本地改动] --index 自定义窗口标题 =====================
+		// 上游原本没有这个参数，窗口标题由 runelite.title 配置项 + 玩家名拼成，多开时无法区分实例。
+		// 本地新增 --index，值会原样成为主窗口的最终标题（不做模板替换、不做截断）。
+		// 用法：--index 12 或 --index="Account 1"
+		// 参数缺省时视为「未指定」，客户端行为与不传该参数完全一致。
+		// 该参数不是敏感参数，会原样打印在启动日志里（不要加进 SENSITIVE_ARGUMENTS）。
+		// 具体应用逻辑见 ClientUI.java 中标注 MICROBOT 本地改动 的位置。
+		// 上游更新后若此处冲突，保留本段即可。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		final ArgumentAcceptingOptionSpec<String> indexOpt = parser.accepts("index", "Set the client window title. 本地新增。")
+			.withRequiredArg()
+			.ofType(String.class);
+		// ===================== [MICROBOT 本地改动] --script 启动指定脚本 =====================
+		// 上游原本没有这个参数，脚本只能手动点工具栏的「启动」按钮跑起来。
+		//
+		// 本地新增 --script：值是脚本 @PluginDescriptor 里的名字，
+		// 客户端启动后自动把那个 side-load 脚本拉起来。
+		// 名字精确匹配、忽略大小写，干净的显示名和注解里的原始名都认。
+		// 用法：--script "Auto Banker"
+		//
+		// 只在 side-load 目录加载的 jar 脚本里找，客户端内置插件不算。
+		// 找不到或者有多个同名都不启动，只记一条 error 日志，客户端照常起来。
+		// 不写进配置：这次跑完，下次开客户端不会自动跑它。
+		//
+		// 传多次时只认最后一个，并记一条 warn。
+		// 该参数不是敏感参数，会原样打印在启动日志里。
+		//
+		// 冲突时如何覆盖：保留本段即可。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		final ArgumentAcceptingOptionSpec<String> scriptOpt = parser.accepts("script", "Start the side-load script with this name. 本地新增。")
+			.withRequiredArg()
+			.ofType(String.class);
 		parser.accepts("noupdate", "Skips the launcher update");
 		parser.accepts("clean-randomdat", "Clean random dat file");
 
         final ArgumentAcceptingOptionSpec<String> proxyInfo = parser.accepts("proxy", "Use a specified proxy. Format: scheme://user:pass@host:port")
                 .withRequiredArg().ofType(String.class);
+        // ===================== [MICROBOT 本地改动] 代理分项参数 =====================
+        // 上游只提供 -proxy=<scheme://user:pass@host:port>（URI 形式）。
+        // 本地新增下面五个分项参数，方便直接填 host/port/账号密码，无需自己拼 URI，
+        // 密码里含 @ # : / 等 URI 保留字符时也能原样传入（分项参数不走 URI 解析）。
+        // 用法：--proxy-type socks5 --proxy-host 1.2.3.4 --proxy-port 1080 --proxy-user u --proxy-pass p
+        // 优先级：只要给了 --proxy-host，就走分项模式并忽略 --proxy 的 URI 形式；
+        //        未给 --proxy-host 时，--proxy 仍按上游 URI 方式解析。
+        // 详细合并规则见 net.runelite.client.proxy.ProxyConfiguration.setupProxy 顶部注释。
+        // 上游更新后若此处冲突，保留本段即可。
+        // ===================== [MICROBOT 本地改动 END] =====================
+        final ArgumentAcceptingOptionSpec<String> proxyType = parser.accepts("proxy-type", "Proxy type for --proxy-host mode (socks5). 本地新增。").withRequiredArg().ofType(String.class);
+        final ArgumentAcceptingOptionSpec<String> proxyHost = parser.accepts("proxy-host", "Proxy host. 本地新增。").withRequiredArg().ofType(String.class);
+        final ArgumentAcceptingOptionSpec<String> proxyPort = parser.accepts("proxy-port", "Proxy port. 本地新增。").withRequiredArg().ofType(String.class);
+        final ArgumentAcceptingOptionSpec<String> proxyUser = parser.accepts("proxy-user", "Proxy username. 本地新增。").withRequiredArg().ofType(String.class);
+        final ArgumentAcceptingOptionSpec<String> proxyPass = parser.accepts("proxy-pass", "Proxy password. 本地新增。").withRequiredArg().ofType(String.class);
         final ArgumentAcceptingOptionSpec<File> sessionfile = parser.accepts("sessionfile", "Use a specified session file")
                 .withRequiredArg()
                 .withValuesConvertedBy(new ConfigFileConverter())
@@ -264,6 +347,24 @@ public class RuneLite
 
         final Logger logger = (Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME);
         logger.setLevel(Level.INFO);
+
+        // ===================== [MICROBOT 本地改动] --script 启动指定脚本 =====================
+        // 取 --script 的值。传多次时只认最后一个，并记一条 warn。
+        // 传法上 --script Foo 和 --script=Foo 都认（commons-cli 自己处理）。
+        //
+        // 冲突时如何覆盖：保留这一段即可。
+        // ===================== [MICROBOT 本地改动 END] =====================
+        String scriptName = null;
+        if (options.has(scriptOpt))
+        {
+            List<String> scriptValues = options.valuesOf(scriptOpt);
+            if (scriptValues.size() > 1)
+            {
+                logger.warn("--script 传了 {} 次，只认最后一个：{}", scriptValues.size(),
+                    scriptValues.get(scriptValues.size() - 1));
+            }
+            scriptName = scriptValues.get(scriptValues.size() - 1);
+        }
 
         if (options.has("debug")) {
             logger.setLevel(Level.DEBUG);
@@ -296,7 +397,24 @@ public class RuneLite
 			}
 		}
 
-		ProxyConfiguration.setupProxy(options, proxyInfo);
+        // ===================== [MICROBOT 本地改动] 代理参数调度 =====================
+        // 两种代理配置方式，优先级：--proxy-host 优先于 --proxy。
+        //   1) 分项模式：给了 --proxy-host，就用 --proxy-type/--proxy-host/--proxy-port/--proxy-user/--proxy-pass，
+        //      不走 URI 解析，密码可含 @ # : / 等字符（无需 URL 编码）。
+        //   2) URI 模式：没给 --proxy-host，沿用上游的 --proxy=<scheme://user:pass@host:port>。
+        // 完整合并规则见 net.runelite.client.proxy.ProxyConfiguration.setupProxy 顶部注释。
+        // 上游更新后若此处冲突，保留本段即可。
+        // ===================== [MICROBOT 本地改动 END] =====================
+        if (options.has(proxyHost)) {
+            ProxyConfiguration.setupProxyFromParts(
+                    options.has(proxyType) ? options.valueOf(proxyType) : null,
+                    options.valueOf(proxyHost),
+                    options.has(proxyPort) ? options.valueOf(proxyPort) : null,
+                    options.has(proxyUser) ? options.valueOf(proxyUser) : null,
+                    options.has(proxyPass) ? options.valueOf(proxyPass) : null);
+        } else {
+            ProxyConfiguration.setupProxy(options, proxyInfo);
+        }
 
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) ->
         {
@@ -313,7 +431,12 @@ public class RuneLite
 
 		SplashScreen.stage(0, "Setting up proxy", "Testing proxy address...");
 
-		if (options.has(proxyInfo)) {
+		// ===================== [MICROBOT 本地改动] 代理分项参数 =====================
+		// 上游只判断 --proxy 是否存在。本地新增的 --proxy-host 分项模式同样需要做出口 IP 检测，
+		// 否则分项模式下会跳过连通性校验和 "Proxy enabled" 状态展示。
+		// 上游更新后若此处冲突，保留 || options.has(proxyHost) 即可。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		if (options.has(proxyInfo) || options.has(proxyHost)) {
 			String ip = ProxyChecker.getDetectedIp(okHttpClient);
 			if (ip.isEmpty()) {
 				Microbot.showMessage("Failed to detect external IP address, check your proxy settings. \n\n Make sure to use the format scheme://user:pass@host:port");
@@ -380,8 +503,26 @@ public class RuneLite
 				options.valueOf(sessionfile),
 				(String) options.valueOf("profile"),
 				(String) options.valueOf("character"),
+				// ===================== [MICROBOT 本地改动] Jagex 会话注入 =====================
+				// 把命令行传入的 Jagex 凭据交给 RuneLiteModule 绑定，供 RuneLite 注入游戏客户端。
+				// ===================== [MICROBOT 本地改动 END] =====================
+				(String) options.valueOf(jagexSessionId),
+				(String) options.valueOf(jagexCharacterId),
+				(String) options.valueOf(jagexDisplayName),
 				options.has(insecureWriteCredentials),
-				options.has("noupdate")
+				options.has("noupdate"),
+				// ===================== [MICROBOT 本地改动] --index 自定义窗口标题 =====================
+				// 把 --index 传入的标题字符串交给 RuneLiteModule 绑定，供 ClientUI 设置窗口标题。
+				// 未提供时用空串，ClientUI 侧用 Strings.isNullOrEmpty 判断「未指定」，
+				// 此时客户端行为与不传该参数完全一致。
+				// ===================== [MICROBOT 本地改动 END] =====================
+				options.has(indexOpt) ? options.valueOf(indexOpt) : "",
+				// ===================== [MICROBOT 本地改动] --script 启动指定脚本 =====================
+				// 把 --script 传入的脚本名交给 RuneLiteModule 绑定，供启动器使用。
+				// 没传时是 null，绑定用 Providers.of(null) 处理，不会炸。
+				// 上游更新后若此处冲突，保留这一行即可。
+				// ===================== [MICROBOT 本地改动 END] =====================
+				scriptName
 			));
 
 			injector.getInstance(RuneLite.class).start();
@@ -560,7 +701,23 @@ public class RuneLite
 
 		client.unblockStartup();
 
-		setCharacter();
+		// ===================== [MICROBOT 本地改动] Jagex 会话注入 =====================
+		// 命令行给了 --session-id 就直接把凭据注入游戏客户端，
+		// 登录界面会直接出现该角色的登录按钮（不需要 OAuth / Launcher 流程）。
+		// 放在 unblockStartup() 之后，与上游 setCharacter() 的注入时机保持一致。
+		// 与上游 --character（角色名）的区别：--character 走本地存储的 session 匹配，
+		// --session-id 则直接用命令行给的凭据；两者同时给时以 --session-id 为准（它更具体），跳过 setCharacter()。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		setJagexSession();
+
+		// ===================== [MICROBOT 本地改动] Jagex 会话注入 =====================
+		// 命令行给了 --session-id 时以它为准，跳过上游按 --character 匹配角色的逻辑。
+		// 否则 setCharacter() 会用本地存储的 session 覆盖掉刚注入的凭据。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		if (jagexSessionId == null || jagexSessionId.isBlank())
+		{
+			setCharacter();
+		}
 
 		if (telemetryClient != null)
 		{
@@ -921,6 +1078,28 @@ public class RuneLite
         okHttpClientBuilder.sslSocketFactory(sc.getSocketFactory(), trustManager);
     }
     // endregion
+
+	/**
+	 * ===================== [MICROBOT 本地改动] Jagex 会话注入 =====================
+	 * 把命令行传入的 Jagex session id / character id 注入游戏客户端。
+	 * 注入后客户端登录界面会直接出现该角色的登录按钮（按回车即可登录），
+	 * 不需要走 Jagex Launcher、OAuth 或交互式账号选择。
+	 * 具体实现见 net.runelite.client.rs.auth.JagexSessionInjector。
+	 *
+	 * 与上游 --character（角色名）的区别：--character 走本地存储的 session 匹配，
+	 * --session-id 则直接用命令行给的凭据；两者同时给时以 --session-id 为准（它更具体）。
+	 * 上游更新后若此处冲突，保留本方法即可。
+	 */
+	private void setJagexSession()
+	{
+		if (jagexSessionId == null || jagexSessionId.isBlank())
+		{
+			return;
+		}
+
+		jagexSessionInjector.inject(jagexSessionId, jagexCharacterId, jagexDisplayName);
+	}
+	// ===================== [MICROBOT 本地改动 END] =====================
 
 	private void setCharacter()
 	{

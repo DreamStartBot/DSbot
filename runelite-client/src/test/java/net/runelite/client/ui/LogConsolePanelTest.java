@@ -1,5 +1,6 @@
 package net.runelite.client.ui;
 
+import ch.qos.logback.classic.Level;
 import java.awt.Point;
 import java.awt.event.ActionEvent;
 import java.awt.event.InputEvent;
@@ -22,17 +23,19 @@ import javax.swing.JMenuItem;
 import javax.swing.JPopupMenu;
 import javax.swing.JScrollBar;
 import javax.swing.JScrollPane;
-import javax.swing.JTextArea;
+import javax.swing.JTextPane;
 import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.event.PopupMenuEvent;
 import javax.swing.event.PopupMenuListener;
-import javax.swing.plaf.basic.BasicTextAreaUI;
+import javax.swing.plaf.basic.BasicTextPaneUI;
 import javax.swing.text.BadLocationException;
 import javax.swing.text.JTextComponent;
 import javax.swing.text.Position;
+import javax.swing.text.StyleConstants;
+import javax.swing.text.StyledDocument;
 import org.junit.Before;
 import org.junit.Test;
 import static org.junit.Assert.assertEquals;
@@ -47,7 +50,7 @@ public class LogConsolePanelTest
 
 	private LogConsolePanel panel;
 	private JScrollPane scrollPane;
-	private JTextArea textArea;
+	private JTextPane textPane;
 
 	@Before
 	public void setUp() throws Exception
@@ -56,13 +59,59 @@ public class LogConsolePanelTest
 		{
 			panel = new LogConsolePanel();
 			scrollPane = (JScrollPane) panel.getComponent(0);
-			textArea = (JTextArea) scrollPane.getViewport().getView();
+			textPane = (JTextPane) scrollPane.getViewport().getView();
 			panel.setSize(400, 160);
 			layOut();
 		});
 		panel.append(lines(0, 200));
 		settle();
 		assertTrue(isAtBottom());
+	}
+
+	@Test
+	public void eachLevelGetsItsOwnColor() throws Exception
+	{
+		assertEquals(LogConsolePanel.colorFor(Level.ERROR), LogConsolePanel.colorFor(Level.ERROR));
+		assertNotEquals(LogConsolePanel.colorFor(Level.ERROR), LogConsolePanel.colorFor(Level.WARN));
+		assertNotEquals(LogConsolePanel.colorFor(Level.WARN), LogConsolePanel.colorFor(Level.INFO));
+		assertNotEquals(LogConsolePanel.colorFor(Level.INFO), LogConsolePanel.colorFor(Level.DEBUG));
+		// 没有等级的输出（脚本里直接 println）跟 INFO 一个颜色
+		assertEquals(LogConsolePanel.colorFor(Level.INFO), LogConsolePanel.colorFor(null));
+	}
+
+	@Test
+	public void linesAreColoredByTheirLevel() throws Exception
+	{
+		// 用一个干净的 panel，避开 setUp 里已经填进去的普通行
+		AtomicReference<LogConsolePanel> fresh = new AtomicReference<>();
+		onEdt(() -> fresh.set(new LogConsolePanel()));
+		LogConsolePanel clean = fresh.get();
+
+		clean.append(Level.ERROR, "boom\n");
+		clean.append(Level.WARN, "careful\n");
+		clean.append(Level.INFO, "hello\n");
+		clean.append(Level.DEBUG, "details\n");
+		settle();
+
+		java.awt.Color[] expected = onEdtGet(() ->
+		{
+			JTextPane pane = (JTextPane) ((JScrollPane) clean.getComponent(0)).getViewport().getView();
+			StyledDocument document = (StyledDocument) pane.getDocument();
+			// 按行首偏移量取颜色：样式相同的连续字符合并成一个 element，
+			// 按元素序号取会一直落在同一段里。
+			int[] starts = {0, 5, 13, 19};
+			java.awt.Color[] colors = new java.awt.Color[4];
+			for (int i = 0; i < 4; i++)
+			{
+				colors[i] = StyleConstants.getForeground(document.getCharacterElement(starts[i]).getAttributes());
+			}
+			return colors;
+		});
+
+		assertEquals(LogConsolePanel.colorFor(Level.ERROR), expected[0]);
+		assertEquals(LogConsolePanel.colorFor(Level.WARN), expected[1]);
+		assertEquals(LogConsolePanel.colorFor(Level.INFO), expected[2]);
+		assertEquals(LogConsolePanel.colorFor(Level.DEBUG), expected[3]);
 	}
 
 	@Test
@@ -79,18 +128,19 @@ public class LogConsolePanelTest
 	{
 		onEdt(() ->
 		{
-			JPopupMenu menu = textArea.getComponentPopupMenu();
-			assertEquals(Arrays.asList("Copy", "Copy all", "Select all", "Clear"), Arrays.stream(menu.getComponents())
+			JPopupMenu menu = textPane.getComponentPopupMenu();
+			assertEquals(Arrays.asList("Copy", "Copy all", "Select all", "Clear", "Show log level", "Show logger name"),
+				Arrays.stream(menu.getComponents())
 				.filter(c -> c instanceof JMenuItem)
 				.map(c -> ((JMenuItem) c).getText())
 				.collect(Collectors.toList()));
 			JMenuItem copy = (JMenuItem) menu.getComponent(0);
 
-			textArea.select(0, 0);
+			textPane.select(0, 0);
 			fireWillBecomeVisible(menu);
 			assertFalse(copy.isEnabled());
 
-			textArea.select(0, 5);
+			textPane.select(0, 5);
 			fireWillBecomeVisible(menu);
 			assertTrue(copy.isEnabled());
 		});
@@ -166,17 +216,17 @@ public class LogConsolePanelTest
 		{
 			Point view = scrollPane.getViewport().getViewPosition();
 			start.set(new Point(5, view.y + 20));
-			textArea.dispatchEvent(mouse(MouseEvent.MOUSE_PRESSED, start.get().x, start.get().y));
-			textArea.dispatchEvent(mouse(MouseEvent.MOUSE_DRAGGED, start.get().x + 60, start.get().y + 20));
-			textArea.dispatchEvent(mouse(MouseEvent.MOUSE_RELEASED, start.get().x + 60, start.get().y + 20));
+			textPane.dispatchEvent(mouse(MouseEvent.MOUSE_PRESSED, start.get().x, start.get().y));
+			textPane.dispatchEvent(mouse(MouseEvent.MOUSE_DRAGGED, start.get().x + 60, start.get().y + 20));
+			textPane.dispatchEvent(mouse(MouseEvent.MOUSE_RELEASED, start.get().x + 60, start.get().y + 20));
 		});
 		settle();
-		String selected = onEdtGet(textArea::getSelectedText);
+		String selected = onEdtGet(textPane::getSelectedText);
 		assertTrue(selected != null && !selected.isEmpty());
 
 		panel.append(lines(200, 50));
 		settle();
-		assertEquals(selected, onEdtGet(textArea::getSelectedText));
+		assertEquals(selected, onEdtGet(textPane::getSelectedText));
 	}
 
 	@Test
@@ -207,7 +257,7 @@ public class LogConsolePanelTest
 	public void starvedEdtInsertsOnlyWhatAFollowerKeeps() throws Exception
 	{
 		List<Integer> inserts = new ArrayList<>();
-		onEdt(() -> textArea.getDocument().addDocumentListener(new DocumentListener()
+		onEdt(() -> textPane.getDocument().addDocumentListener(new DocumentListener()
 		{
 			@Override
 			public void insertUpdate(DocumentEvent ev)
@@ -261,7 +311,7 @@ public class LogConsolePanelTest
 		{
 			try
 			{
-				return textArea.getDocument().getText(0, textArea.getDocument().getLength());
+				return textPane.getDocument().getText(0, textPane.getDocument().getLength());
 			}
 			catch (BadLocationException ex)
 			{
@@ -281,7 +331,7 @@ public class LogConsolePanelTest
 		Thread.setDefaultUncaughtExceptionHandler((thread, ex) -> uncaught.set(ex));
 		try
 		{
-			onEdt(() -> textArea.setUI(new BasicTextAreaUI()
+			onEdt(() -> textPane.setUI(new BasicTextPaneUI()
 			{
 				@Override
 				public Rectangle2D modelToView2D(JTextComponent component, int pos, Position.Bias bias)
@@ -302,14 +352,14 @@ public class LogConsolePanelTest
 	@Test
 	public void trimmingDropsWholeLines() throws Exception
 	{
-		int length = onEdtGet(() -> textArea.getDocument().getLength());
+		int length = onEdtGet(() -> textPane.getDocument().getLength());
 		panel.append("y".repeat(DOCUMENT_CAP - length + 2) + "\n");
 		settle();
 		String text = onEdtGet(() ->
 		{
 			try
 			{
-				return textArea.getDocument().getText(0, textArea.getDocument().getLength());
+				return textPane.getDocument().getText(0, textPane.getDocument().getLength());
 			}
 			catch (BadLocationException ex)
 			{
@@ -325,14 +375,14 @@ public class LogConsolePanelTest
 	{
 		onEdt(() ->
 		{
-			KeyEvent key = new KeyEvent(textArea, KeyEvent.KEY_PRESSED, System.currentTimeMillis(),
+			KeyEvent key = new KeyEvent(textPane, KeyEvent.KEY_PRESSED, System.currentTimeMillis(),
 				modifiers, keyCode, KeyEvent.CHAR_UNDEFINED);
-			for (KeyListener listener : textArea.getKeyListeners())
+			for (KeyListener listener : textPane.getKeyListeners())
 			{
 				listener.keyPressed(key);
 			}
-			Object binding = textArea.getInputMap().get(KeyStroke.getKeyStrokeForEvent(key));
-			textArea.getActionMap().get(binding).actionPerformed(new ActionEvent(textArea, ActionEvent.ACTION_PERFORMED, null));
+			Object binding = textPane.getInputMap().get(KeyStroke.getKeyStrokeForEvent(key));
+			textPane.getActionMap().get(binding).actionPerformed(new ActionEvent(textPane, ActionEvent.ACTION_PERFORMED, null));
 		});
 	}
 
@@ -352,7 +402,7 @@ public class LogConsolePanelTest
 	private MouseEvent mouse(int id, int x, int y)
 	{
 		int modifiers = id == MouseEvent.MOUSE_RELEASED ? 0 : InputEvent.BUTTON1_DOWN_MASK;
-		return new MouseEvent(textArea, id, System.currentTimeMillis(), modifiers, x, y, 1, false, MouseEvent.BUTTON1);
+		return new MouseEvent(textPane, id, System.currentTimeMillis(), modifiers, x, y, 1, false, MouseEvent.BUTTON1);
 	}
 
 	private void layOut()

@@ -16,6 +16,13 @@ RuneLite fork with a hidden always-on plugin hosting automation scripts. Composi
 - Respect existing Checkstyle/Lombok patterns; don't weaken security (telemetry tokens, HTTP clients).
 - Minimal logging; no PII or session identifiers.
 
+## Local changes to upstream files
+- Any edit to a file that already exists in the repo (tracked by git) must be wrapped in a `// ===================== [MICROBOT 本地改动] <主题> =====================` marker, closed with `[MICROBOT 本地改动 END]`. This applies to every pre-existing file, not just the ones under RuneLite's own packages — a file in a microbot package is still pre-existing code and still needs marking.
+- The comments inside such a marker must be in Chinese and must state: what upstream does, what the local change does, and how to resolve the spot when an upstream merge conflicts.
+- Comments written in this repository are Chinese. Keep upstream code itself untouched.
+- Record every change in `docs/LOCAL_PATCHES.md`; keep that list in sync when adding or removing a change.
+- Locate all change points with `rg -n "MICROBOT 本地改动" runelite-client/`.
+
 ## Review priority
 - **P0:** client crashes, client-thread blocking, login/world-hop breakage, cache invariant corruption, credential/token exposure.
 - **P1:** script loop timing, overlay correctness, plugin discovery/config, shaded-jar packaging, build reproducibility.

@@ -1,11 +1,22 @@
 <component name="ProjectRunConfigurationManager">
+  <!--
+    [MICROBOT 本地改动] 代理启动参数
+    上游 RuneLite 只支持单参数形式：-proxy=<scheme://user:pass@host:port>，
+    且不支持 http/https（会直接退出），因此原来的 "-proxy=144.49.99.215:8080 -proxy-type=http" 是跑不起来的。
+    现在客户端本地新增了分项参数（见 RuneLite.java / ProxyConfiguration.java 中 MICROBOT 本地改动 标记）：
+        -proxy-type socks5 -proxy-host <host> -proxy-port <port> -proxy-user <user> -proxy-pass <pass>
+    分项参数不走 URI 解析，所以密码里的 @ # : / 等字符可以原样填写，无需 URL 编码。
+
+    ⚠ 安全提示：本文件里的代理账号密码是明文，且 .run/ 目录通常会提交到 Git。
+      若仓库要公开或多人协作，请改用环境变量方式，或把本文件加入 .gitignore。
+  -->
   <configuration default="false" name="Runelite with proxy" type="Application" factoryName="Application">
     <option name="MAIN_CLASS_NAME" value="net.runelite.client.RuneLite" />
     <module name="runelite.client.main" />
     <shortenClasspath name="ARGS_FILE" />
-    <option name="PROGRAM_PARAMETERS" value="-developer-mode -proxy=144.49.99.215:8080 -proxy-type=http"/>
+    <option name="PROGRAM_PARAMETERS" value="-developer-mode -proxy-type socks5 -proxy-host 43.161.196.48 -proxy-port 20001 -proxy-user lantianbaiyun -proxy-pass &quot;kaixinba321A!@#&quot;" />
     <option name="VM_PARAMETERS" value="-ea" />
-    <option name="WORKING_DIRECTORY" value="$USER_HOME$/.runelite"/>
+    <option name="WORKING_DIRECTORY" value="$USER_HOME$/.runelite" />
     <method v="2">
       <option name="Make" enabled="true" />
     </method>

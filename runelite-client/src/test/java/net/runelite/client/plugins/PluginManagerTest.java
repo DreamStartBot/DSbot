@@ -107,10 +107,27 @@ public class PluginManagerTest
 		when(configLoader.get()).thenReturn(mock(RuntimeConfig.class));
 
 		Injector injector = Guice.createInjector(Modules
-			.override(new RuneLiteModule(okHttpClient, () -> null, configLoader, true, false, false, true,
-				RuneLite.DEFAULT_SESSION_FILE,
-				null, null, false, false
-			))
+			// ===================== [MICROBOT 本地改动] 构造参数补齐 =====================
+			// RuneLiteModule 的构造参数是按字段顺序生成的（@AllArgsConstructor）。
+			// 本地给 RuneLiteModule 加过字段，这里必须同步补齐，否则测试代码编译不过。
+			// 当前顺序：
+			//   okHttpClient, clientLoader, configLoader,
+			//   developerMode, safeMode, disableTelemetry, disableWalkerUpdate,
+			//   sessionfile, profile, character,
+		//   jagexSessionId, jagexCharacterId, jagexDisplayName,   ← 本地新增
+		//   insecureWriteCredentials, noupdate,
+		//   windowTitleOverride,                                  ← 本地新增
+		//   scriptName                                            ← 本地新增
+		// 以后再给 RuneLiteModule 加字段，记得回来补这里。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		.override(new RuneLiteModule(okHttpClient, () -> null, configLoader, true, false, false, true,
+			RuneLite.DEFAULT_SESSION_FILE,
+			null, null,
+			null, null, null,
+			false, false,
+			"",
+			null
+		))
 			.with(BoundFieldModule.of(this)));
 
 		RuneLite.setInjector(injector);

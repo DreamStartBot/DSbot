@@ -64,6 +64,7 @@ import javax.inject.Singleton;
 import javax.swing.*;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
@@ -87,6 +88,18 @@ import java.util.stream.Collectors;
 @Singleton
 public class MicrobotPluginManager {
     private static final File PLUGIN_DIR = new File(RuneLite.RUNELITE_DIR, "microbot-plugins");
+    // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+    // 运行时副本目录：用副本加载脚本 jar，让原 jar 复制完就能立刻释放。
+    //
+    // 为什么要副本：URLClassLoader 打开 jar 时会一直持有文件句柄，
+    // 在 Windows 上原 jar 会被锁住，没法覆盖 —— 调试时反复替换脚本 jar 很不方便。
+    // 改成把原 jar 复制到这个目录再用副本加载，原 jar 复制完就没人占着了。
+    //
+    // 副本在脚本卸载时删除，客户端退出时清理整个目录。
+    //
+    // 冲突时如何覆盖：保留这个常量。
+    // ===================== [MICROBOT 本地改动 END] =====================
+    private static final File RUNTIME_PLUGIN_DIR = new File(RuneLite.RUNELITE_DIR, "microbot-plugins-runtime");
     private static final String INSTALLED_VERSION_GROUP = "microbotPluginVersions";
     private static final String INSTALLED_VERSION_KEY_PREFIX = "plugin.";
     private static final String UPDATE_NOTIFICATION_GROUP = "microbotPluginUpdateNotifications";
@@ -102,6 +115,17 @@ public class MicrobotPluginManager {
     private final MicrobotApi microbotApi;
 
     private final Map<String, URLClassLoader> loaders = new ConcurrentHashMap<>();
+
+    // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+    // 每个脚本对应的运行时副本文件。
+    //
+    // 为什么要副本：URLClassLoader 打开 jar 时会一直持有文件句柄，
+    // Windows 上原 jar 会被锁住，覆盖不了。改成复制一份到运行时目录再加载，
+    // 原 jar 复制完就没人占着了。
+    //
+    // 冲突时如何覆盖：保留这个字段。
+    // ===================== [MICROBOT 本地改动 END] =====================
+    private final Map<String, File> runtimeCopies = new ConcurrentHashMap<>();
 
     private final Map<String, String> blockedPlugins = new ConcurrentHashMap<>();
 
@@ -348,12 +372,14 @@ public class MicrobotPluginManager {
             log.debug("Plugin file {} does not exist", pluginFile);
             return;
         }
-        Set<String> loadedInternalNames = pluginManager.getPlugins().stream()
-                .filter(p -> p.getClass().isAnnotationPresent(PluginDescriptor.class))
-                .filter(p -> p.getClass().getAnnotation(PluginDescriptor.class).isExternal())
-                .map(p -> p.getClass().getSimpleName())
-                .collect(Collectors.toSet());
-        if (loadedInternalNames.contains(internalName)) {
+        // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+        // 上游原本在这里拿「已加载插件的类名集合」判断这个 jar 加载过没有，
+        // 同样依赖「jar 文件名 == 插件类名」的假设，一个 jar 装多个脚本时会判断错。
+        // 改成查 loaders：它的 key 就是 jar 的 internalName，是正确的判断依据。
+        //
+        // 冲突时如何覆盖：保留这一行。
+        // ===================== [MICROBOT 本地改动 END] =====================
+        if (loaders.containsKey(internalName)) {
             return;
         }
         try {
@@ -361,7 +387,24 @@ public class MicrobotPluginManager {
                 log.warn("Plugin hash verification failed for: {}", internalName);
             }
             List<Class<?>> plugins = new ArrayList<>();
-            PluginJarClassLoader classLoader = new PluginJarClassLoader(pluginFile, getClass().getClassLoader());
+            // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+            // 上游原本直接用原 jar 建 ClassLoader：
+            //     new PluginJarClassLoader(pluginFile, ...)
+            // URLClassLoader 会一直持有 jar 的文件句柄，Windows 上原 jar 就被锁住了，
+            // 覆盖不了 —— 调试时反复替换脚本 jar 很不方便。
+            //
+            // 本地改成先把原 jar 复制到运行时目录，再用副本建 ClassLoader。
+            // 复制完成后原 jar 没有任何进程持有句柄，可以随时覆盖。
+            //
+            // 用副本而不是"加载完就 close ClassLoader"，是因为 close 之后
+            // 运行时再想加载 jar 里的类（懒加载的依赖库）会失败，
+            // 而读 jar 里的资源文件也会失效。副本没有这个副作用。
+            //
+            // 冲突时如何覆盖：保留这几行。改回直接用 pluginFile 建 ClassLoader
+            // 会让原 jar 重新被锁住。
+            // ===================== [MICROBOT 本地改动 END] =====================
+            File runtimeCopy = createRuntimeCopy(pluginFile, internalName);
+            PluginJarClassLoader classLoader = new PluginJarClassLoader(runtimeCopy, getClass().getClassLoader());
             loaders.put(internalName, classLoader);
             for (ClassPath.ClassInfo classInfo : ClassPath.from(classLoader).getAllClasses()) {
                 try {
@@ -376,6 +419,9 @@ public class MicrobotPluginManager {
             }
             if (loadPlugins(plugins, null).isEmpty() && loaders.remove(internalName, classLoader)) {
                 classLoader.close();
+                log.warn("Side-load jar {} produced no plugins", internalName);
+            } else {
+                log.info("Loaded side-load jar {}", internalName);
             }
         } catch (PluginInstantiationException | IOException e) {
             log.trace("Error loading side-loaded plugin!", e);
@@ -391,17 +437,22 @@ public class MicrobotPluginManager {
         if (files == null) {
             return;
         }
-        Set<String> loadedInternalNames = pluginManager.getPlugins().stream()
-                .filter(p -> p.getClass().isAnnotationPresent(PluginDescriptor.class))
-                .filter(p -> p.getClass().getAnnotation(PluginDescriptor.class).isExternal())
-                .map(p -> p.getClass().getSimpleName())
-                .collect(Collectors.toSet());
+        // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+        // 上游原本拿「已加载插件的类名集合」去和 jar 文件名比，判断这个 jar 加载过没有。
+        // 这依赖「jar 文件名 == 插件类名」这个假设：一个 jar 装多个脚本时对不上，
+        // 于是每次都会重新加载一遍，重载后 pluginManager 里会多出重复的同名插件。
+        // 改成直接查 loaders —— 它的 key 就是 jar 的 internalName（jar 文件名），
+        // 是判断"这个 jar 加载过没有"的正确依据。
+        //
+        // 冲突时如何覆盖：保留这两行。
+        // ===================== [MICROBOT 本地改动 END] =====================
         for (File f : files) {
             if (!f.getName().endsWith(".jar")) {
                 continue;
             }
             String internalName = f.getName().replace(".jar", "");
-            if (loadedInternalNames.contains(internalName)) {
+            if (loaders.containsKey(internalName)) {
+                log.debug("Side-load jar {} is already loaded, skipping", internalName);
                 continue;
             }
             try {
@@ -411,6 +462,296 @@ public class MicrobotPluginManager {
             }
         }
         eventBus.post(new ExternalPluginsChanged());
+    }
+
+    // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+    // 本地新增：为工具栏的「启动」按钮提供「全量重新加载脚本 jar」的能力。
+    //
+    // 上游原本只有 loadSideLoadPlugins()，它是增量语义 —— 只加载目录里新出现的 jar，
+    // 已经加载过的按类名跳过，既不停掉也不卸载任何东西。
+    //
+    // 本地新增这一组方法，做全量语义：
+    //   reloadSideLoadPlugins()  —— 停掉并卸载所有 side-load 脚本，再重新扫描目录加载一遍
+    //   unloadSideLoadPlugins()  —— 只做停掉+卸载，不重新加载
+    //   unloadSideLoadPlugin(名) —— 停掉+卸载单个脚本
+    //   findSideLoadPlugin(...)  —— 判定某个插件是不是由指定 jar 的 ClassLoader 加载的
+    //   stopAndRemove(插件)      —— 停插件并从插件管理器摘掉
+    //
+    // 三条关键约束（改这个文件时必须一起维护）：
+    //   1. 判定归属要同时满足「类名匹配」和「ClassLoader 相同」。只比类名的话，
+    //      碰巧同名的另一个插件会被误停。详见 findSideLoadPlugin 的注释。
+    //   2. PluginManager.stopPlugin 里有 assert SwingUtilities.isEventDispatchThread()，
+    //      停插件必须在 EDT 上做，所以 stopAndRemove 内部自己切线程。
+    //   3. 必须关掉 ClassLoader 才能释放 jar 文件句柄（Windows 上尤其重要），
+    //      否则同一个 jar 再加载会失败。
+    //
+    // 冲突时如何覆盖：整块保留。这组方法是纯新增，没有改动上游任何原有逻辑，
+    // 上游更新后若此处冲突，直接保留本地这一段即可。
+    // 但 remove() 里有一段配套的替换，见下方另一处标记。
+    // ===================== [MICROBOT 本地改动 END] =====================
+
+    /**
+     * 把原 jar 复制到运行时目录，返回副本。
+     *
+     * <p>复制用的就是普通文件拷贝，读完就释放句柄，所以原 jar 之后可以随便覆盖。
+     *
+     * @param pluginFile  原 jar
+     * @param internalName 脚本的内部名
+     * @return 副本文件
+     */
+    // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+    // 本地新增。配合 loadSideLoadPlugin 用副本加载，让原 jar 不被占用。
+    //
+    // 副本用带序号的名字，避免"目标文件已存在"的问题：
+    // 上一个副本可能还被上一轮的 ClassLoader 占着，写不进去。
+    //
+    // 冲突时如何覆盖：保留整个方法。
+    // ===================== [MICROBOT 本地改动 END] =====================
+    private File createRuntimeCopy(File pluginFile, String internalName) throws IOException {
+        // 先把上一轮的副本清掉，能删就删
+        deleteRuntimeCopy(internalName);
+
+        if (!RUNTIME_PLUGIN_DIR.isDirectory() && !RUNTIME_PLUGIN_DIR.mkdirs()) {
+            throw new IOException("Could not create runtime plugin directory " + RUNTIME_PLUGIN_DIR);
+        }
+
+        File copy = new File(RUNTIME_PLUGIN_DIR, internalName + "-" + System.nanoTime() + ".jar");
+        try (InputStream in = new FileInputStream(pluginFile);
+             java.io.OutputStream out = new FileOutputStream(copy)) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = in.read(buffer)) > 0) {
+                out.write(buffer, 0, read);
+            }
+        }
+        runtimeCopies.put(internalName, copy);
+        return copy;
+    }
+
+    /**
+     * 删掉某个脚本的运行时副本。
+     */
+    // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+    // 本地新增。脚本卸载时调用，删掉它占用的副本。
+    //
+    // 冲突时如何覆盖：保留整个方法。
+    // ===================== [MICROBOT 本地改动 END] =====================
+    private void deleteRuntimeCopy(String internalName) {
+        File copy = runtimeCopies.remove(internalName);
+        if (copy == null) {
+            return;
+        }
+        try {
+            // 这个文件已经 import 了 com.google.common.io.Files，所以 nio 的要用全限定名
+            java.nio.file.Files.deleteIfExists(copy.toPath());
+        } catch (IOException e) {
+            log.warn("Could not delete runtime copy for {}", internalName, e);
+        }
+    }
+
+    /**
+     * 清空运行时副本目录。
+     *
+     * <p>客户端退出时调用。脚本运行中崩掉的话会留下残留，
+     * 下次启动时会被同名副本覆盖，不用额外清理。
+     */
+    // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+    // 本地新增。客户端退出时调用。
+    //
+    // 冲突时如何覆盖：保留整个方法。
+    // ===================== [MICROBOT 本地改动 END] =====================
+    private void cleanupRuntimeCopies() {
+        for (String internalName : new ArrayList<>(runtimeCopies.keySet())) {
+            deleteRuntimeCopy(internalName);
+        }
+        File[] files = RUNTIME_PLUGIN_DIR.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File file : files) {
+            try {
+                java.nio.file.Files.deleteIfExists(file.toPath());
+            } catch (IOException e) {
+                log.warn("Could not delete runtime copy {}", file.getName(), e);
+            }
+        }
+    }
+
+    /**
+     * 全量重新加载 side-load 目录里的所有脚本。
+     *
+     * <p>会先停掉并卸载当前已加载的脚本，再重新扫描目录加载一遍。
+     * <b>正在运行的脚本会被打断。</b>
+     *
+     * <p>停插件必须在 EDT 上执行（{@code PluginManager.stopPlugin} 断言这一点），
+     * 所以这个方法要么在 EDT 上调，要么它自己切过去。
+     */
+    public void reloadSideLoadPlugins() {
+        log.info("Reloading side-load plugins. Before: {}", describeLoadedExternalPlugins());
+        unloadSideLoadPlugins();
+        loadSideLoadPlugins();
+        log.info("Reloaded side-load plugins. After: {}", describeLoadedExternalPlugins());
+    }
+
+    // ===================== [MICROBOT 本地改动] --script 启动指定脚本 =====================
+    // 本地新增：返回所有由 side-load 目录里的 jar 加载的插件。
+    //
+    // 判定方式：比较插件类的 ClassLoader 和 loaders 表里的 loader 是不是同一个对象。
+    // 这跟 findSideLoadPlugins 用的是同一套判定，只是那边是包私有的静态方法。
+    //
+    // 只认 side-load 的 jar：客户端内置插件、以及从 pluginhub 下载的外部插件都不算。
+    //
+    // 冲突时如何覆盖：保留整个方法。
+    // ===================== [MICROBOT 本地改动 END] =====================
+    public List<Plugin> getSideLoadPlugins() {
+        List<Plugin> result = new ArrayList<>();
+        for (URLClassLoader loader : loaders.values()) {
+            result.addAll(findSideLoadPlugins(pluginManager.getPlugins(), loader));
+        }
+        return result;
+    }
+
+    /**
+     * 找出这个插件是从哪个 side-load jar 加载的。
+     *
+     * <p>jar 的内部名（文件名去掉 .jar）跨重载是稳定的 —— 重载会换一个
+     * ClassLoader，但 jar 文件名不变。所以重启脚本时可以用它来定位
+     * 「重载后的那一个」，光靠类名不够：同名同包的类装在不同的 jar 里
+     * 会有两个候选。
+     *
+     * @param plugin 插件
+     * @return jar 的内部名，不是 side-load 来的返回 null
+     */
+    // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+    // 本地新增。配合上面的 findSideLoadPlugins 用。
+    //
+    // 上游原本没有这个方法。它要解决的是「重载后怎么找到刚刚加载的那一个」：
+    // 重载会换一个 ClassLoader，同一个 jar 里的类会拿到新的 Class 对象，
+    // 光靠类名定位会有两个候选（同名同包的类装在不同的 jar 里）。
+    // 改成用 jar 的 internalName（jar 文件名去掉 .jar）—— 它跨重载是稳定的。
+    //
+    // 冲突时如何覆盖：保留整个方法。
+    // ===================== [MICROBOT 本地改动 END] =====================
+    @Nullable
+    public String findSideLoadJarName(Plugin plugin) {
+        if (plugin == null) {
+            return null;
+        }
+        for (Map.Entry<String, URLClassLoader> entry : loaders.entrySet()) {
+            if (!findSideLoadPlugins(Collections.singletonList(plugin), entry.getValue()).isEmpty()) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 把当前已加载的 external 插件列成一行字符串，用于日志。
+     */
+    private String describeLoadedExternalPlugins() {
+        return pluginManager.getPlugins().stream()
+                .filter(p -> {
+                    PluginDescriptor d = p.getClass().getAnnotation(PluginDescriptor.class);
+                    return d != null && d.isExternal();
+                })
+                .map(p -> p.getClass().getSimpleName() + "@" + p.getClass().getClassLoader().getClass().getSimpleName())
+                .collect(Collectors.joining(", ", "[", "]"));
+    }
+
+    /**
+     * 停掉并卸载所有从 side-load 目录加载的脚本。
+     *
+     * <p>只认由 side-load 的 ClassLoader 加载的插件，客户端内置的插件不受影响。
+     */
+    public void unloadSideLoadPlugins() {
+        for (String internalName : new ArrayList<>(loaders.keySet())) {
+            unloadSideLoadPlugin(internalName);
+        }
+    }
+
+    /**
+     * 停掉并卸载一个从 side-load 目录加载的脚本。
+     *
+     * @param internalName 脚本的内部名，也就是 jar 文件名去掉 .jar
+     */
+    private void unloadSideLoadPlugin(String internalName) {
+        URLClassLoader jarLoader = loaders.get(internalName);
+        if (jarLoader == null) {
+            return;
+        }
+
+        // 按 ClassLoader 判定归属：这个 jar 加载出来的插件全部都要卸掉。
+        // 一个 jar 里装多个脚本时，只按 jar 名去匹配类名会漏掉一部分。
+        List<Plugin> owned = findSideLoadPlugins(pluginManager.getPlugins(), jarLoader);
+        loaders.remove(internalName);
+
+        for (Plugin plugin : owned) {
+            stopAndRemove(plugin);
+        }
+
+        try {
+            if (jarLoader != null) {
+                jarLoader.close();
+            }
+        } catch (Exception ignored) {
+        }
+
+        // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+        // 删掉运行时副本。ClassLoader 关掉之后副本就不再被占用，可以删了。
+        //
+        // 冲突时如何覆盖：保留这一行。
+        // ===================== [MICROBOT 本地改动 END] =====================
+        deleteRuntimeCopy(internalName);
+
+        log.info("Unloaded side-load plugin jar {} ({} plugin(s))", internalName, owned.size());
+    }
+
+    /**
+     * 找出由指定 ClassLoader 加载的所有插件。
+     *
+     * <p>用 ClassLoader 判定归属，<b>不依赖「jar 文件名 == 插件类名」这个假设</b>。
+     * 上游（以及本地最初的写法）拿 internalName 去和类的 simpleName 比，
+     * 一个 jar 里装多个脚本时对不上，脚本就永远卸不掉 —— 旧的还挂在插件管理器上，
+     * 而 ClassLoader 已经被关掉，重载后就会多出重复的同名插件。
+     *
+     * <p>同名但来自别的 ClassLoader 的插件不会命中，那正是要保护的对象。
+     *
+     * @param plugins 所有已注册的插件
+     * @param loader  side-load 用的 ClassLoader
+     * @return 由该 ClassLoader 加载的插件
+     */
+    @Nullable
+    static List<Plugin> findSideLoadPlugins(Collection<Plugin> plugins, ClassLoader loader) {
+        if (loader == null) {
+            return Collections.emptyList();
+        }
+        return plugins.stream()
+                .filter(x -> x.getClass().getClassLoader() == loader)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 停掉一个插件并从插件管理器里摘掉。
+     *
+     * <p>停插件必须在 EDT 上做。
+     */
+    private void stopAndRemove(Plugin plugin) {
+        try {
+            if (SwingUtilities.isEventDispatchThread()) {
+                pluginManager.stopPlugin(plugin);
+            } else {
+                SwingUtilities.invokeAndWait(() -> {
+                    try {
+                        pluginManager.stopPlugin(plugin);
+                    } catch (PluginInstantiationException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            }
+        } catch (Exception e) {
+            log.warn("Error stopping plugin {}: {}", plugin.getClass().getSimpleName(), e.getMessage());
+        }
+        pluginManager.remove(plugin);
     }
 
     /**
@@ -454,12 +795,22 @@ public class MicrobotPluginManager {
                 .directed()
                 .build();
 
-        Set<Class<?>> alreadyLoaded = pluginManager.getPlugins().stream()
-                .map(Object::getClass)
+        // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+        // 上游原本按 Class 对象判断"这个插件是否已经加载"。
+        // 全量重载会新建 ClassLoader，同一个 jar 里的类会拿到新的 Class 对象，
+        // 于是这个检查挡不住重复加载 —— 重载后 pluginManager 里会同时存在新旧两份同名插件。
+        // 改成按全限定类名判断：只要 pluginManager 里已经有同名的插件，就不再重复加载。
+        // 用全限定名而不是简单名，避免 a.Foo 和 b.Foo 这种同名不同包的插件被误挡。
+        //
+        // 冲突时如何覆盖：保留这段替换。上游更新后若此处冲突，
+        // 把判断改回按 Class 对象比较会重新引入"重载后出现重复插件"的问题。
+        // ===================== [MICROBOT 本地改动 END] =====================
+        Set<String> alreadyLoaded = pluginManager.getPlugins().stream()
+                .map(p -> p.getClass().getName())
                 .collect(Collectors.toSet());
 
         for (Class<?> clazz : plugins) {
-            if (alreadyLoaded.contains(clazz)) {
+            if (alreadyLoaded.contains(clazz.getName())) {
                 log.debug("Plugin {} is already loaded, skipping duplicate.", clazz.getSimpleName());
                 continue;
             }
@@ -1112,28 +1463,22 @@ public class MicrobotPluginManager {
                 .filter(x -> jarLoader != null && x.getClass().getClassLoader() == jarLoader)
                 .findFirst();
         if (pluginToRemove.isPresent()) {
-            URLClassLoader cl = loaders.remove(internalName);
-
-            var plugin = pluginToRemove.get();
-            try {
-                SwingUtilities.invokeAndWait(() ->
-                {
-                    try {
-                        pluginManager.stopPlugin(plugin);
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-            } catch (InterruptedException | InvocationTargetException e) {
-                throw new RuntimeException(e);
-            }
-
-            pluginManager.remove(plugin);
-
-            try {
-                cl.close();
-            } catch (Exception ignored) {
-            }
+            // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+            // 上游原本在这里内联了一整段「停插件 + 从插件管理器摘掉 + 关 ClassLoader」的代码。
+            // 本地把它抽成了 unloadSideLoadPlugin(internalName)，和全量重载复用同一套逻辑，
+            // 避免两份实现走偏 —— 尤其是「ClassLoader 一定要关掉」这条不变量。
+            //
+            // 行为与上游等价：上游是 loaders.remove -> stopPlugin -> pluginManager.remove -> cl.close()，
+            // unloadSideLoadPlugin 做的也是这四步，顺序一致。
+            // 唯一差别在异常处理：上游这段在非 EDT 线程上会用 invokeAndWait，
+            // 失败时把异常包成 RuntimeException 往上抛（会中断后面的删 jar 文件流程）；
+            // 本地改成记一条 warn 日志后继续，不影响后续流程。
+            //
+            // 冲突时如何覆盖：保留这一行调用，把上游那一大段内联代码删掉。
+            // 若上游重构了这段，优先保留本地的 unloadSideLoadPlugin 调用，
+            // 并把 unloadSideLoadPlugin 里的四步顺序与上游对齐。
+            // ===================== [MICROBOT 本地改动 END] =====================
+            unloadSideLoadPlugin(internalName);
         } else {
             log.warn("Plugin to remove not found in plugin manager: {}", internalName);
         }
@@ -1259,6 +1604,24 @@ public class MicrobotPluginManager {
             for (Plugin plugin : externalPlugins) {
                 stopPlugin(plugin);
             }
+
+            // ===================== [MICROBOT 本地改动] side-load 脚本全量重载 =====================
+            // 清理运行时副本目录。上面的 stopPlugin 只停插件，不会关掉 side-load 的
+            // ClassLoader，所以副本文件这时可能还被占着，关掉句柄才能删掉。
+            //
+            // 冲突时如何覆盖：保留这几行。
+            // ===================== [MICROBOT 本地改动 END] =====================
+            for (String internalName : new ArrayList<>(loaders.keySet())) {
+                URLClassLoader loader = loaders.remove(internalName);
+                if (loader != null) {
+                    try {
+                        loader.close();
+                    } catch (Exception ignored) {
+                    }
+                }
+                deleteRuntimeCopy(internalName);
+            }
+            cleanupRuntimeCopies();
 
             log.info("MicrobotPluginManager shutdown complete");
         } catch (Exception e) {

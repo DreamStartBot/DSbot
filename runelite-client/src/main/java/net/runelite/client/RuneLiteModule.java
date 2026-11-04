@@ -75,8 +75,36 @@ public class RuneLiteModule extends AbstractModule
 	private final File sessionfile;
 	private final String profile;
 	private final String character;
+	// ===================== [MICROBOT 本地改动] Jagex 会话注入 =====================
+	// 本地新增：从命令行传入 Jagex session id / character id / 角色名，
+	// 用于在不经过 OAuth 登录流程的情况下把账号凭据注入游戏客户端（登录界面直接出现该角色的登录按钮）。
+	// 与 profile / character 一样通过 Guice 的 @Named 绑定传给 RuneLite。
+	// 详见 RuneLite.java 中标注 MICROBOT 本地改动 的位置。
+	// ===================== [MICROBOT 本地改动 END] =====================
+	private final String jagexSessionId;
+	private final String jagexCharacterId;
+	private final String jagexDisplayName;
 	private final boolean insecureWriteCredentials;
 	private final boolean noupdate;
+	// ===================== [MICROBOT 本地改动] --index 自定义窗口标题 =====================
+	// 本地新增：从命令行传入的窗口标题覆盖值（--index）。
+	// 上游原本没有这个参数，窗口标题固定由 runelite.title 配置项 + 玩家名拼成。
+	// 与 profile / character 一样通过 Guice 的 @Named 绑定传给 ClientUI。
+	// 详见 ClientUI.java 中标注 MICROBOT 本地改动 的位置。
+	// ===================== [MICROBOT 本地改动 END] =====================
+	private final String windowTitleOverride;
+	// ===================== [MICROBOT 本地改动] --script 启动指定脚本 =====================
+	// 本地新增：命令行 --script 传入的脚本名。
+	// 上游原本没有这个参数，脚本只能手动点工具栏的按钮启动。
+	//
+	// ⚠️ 这个类用 @AllArgsConstructor，字段顺序就是构造参数顺序。
+	// 新字段必须放在最后 —— 挪位置会让所有 new RuneLiteModule(...) 的传参错位
+	// （包括测试里的 PluginManagerTest）。
+	//
+	// 与 profile / character 一样通过 Guice 的 @Named 绑定传给启动器。
+	// 详见 CommandLineScriptLauncher.java 中标注 MICROBOT 本地改动 的位置。
+	// ===================== [MICROBOT 本地改动 END] =====================
+	private final String scriptName;
 
 	@Override
 	protected void configure()
@@ -125,8 +153,26 @@ public class RuneLiteModule extends AbstractModule
 		bind(File.class).annotatedWith(Names.named("sessionfile")).toInstance(sessionfile);
 		bind(String.class).annotatedWith(Names.named("profile")).toProvider(Providers.of(profile));
 		bind(String.class).annotatedWith(Names.named("character")).toProvider(Providers.of(character));
+		// ===================== [MICROBOT 本地改动] Jagex 会话注入 =====================
+		// 本地新增的三个绑定，供 RuneLite 注入命令行传入的 Jagex 凭据。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		bind(String.class).annotatedWith(Names.named("jagexSessionId")).toProvider(Providers.of(jagexSessionId));
+		bind(String.class).annotatedWith(Names.named("jagexCharacterId")).toProvider(Providers.of(jagexCharacterId));
+		bind(String.class).annotatedWith(Names.named("jagexDisplayName")).toProvider(Providers.of(jagexDisplayName));
 		bindConstant().annotatedWith(Names.named("insecureWriteCredentials")).to(insecureWriteCredentials);
 		bindConstant().annotatedWith(Names.named("noupdate")).to(noupdate);
+		// ===================== [MICROBOT 本地改动] --index 自定义窗口标题 =====================
+		// 本地新增：把 --index 传入的标题字符串绑定给 ClientUI。
+		// 上游更新后若此处冲突，保留这一行即可。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		bindConstant().annotatedWith(Names.named("windowTitleOverride")).to(windowTitleOverride);
+		// ===================== [MICROBOT 本地改动] --script 启动指定脚本 =====================
+		// 本地新增：把 --script 传入的脚本名绑定给启动器。
+		// 用 toProvider(Providers.of(...)) 而不是 bindConstant —— 后者不接受 null，
+		// 而没传 --script 时这里就是 null。
+		// 上游更新后若此处冲突，保留这一行即可。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		bind(String.class).annotatedWith(Names.named("scriptName")).toProvider(Providers.of(scriptName));
 		bind(File.class).annotatedWith(Names.named("runeLiteDir")).toInstance(RuneLite.RUNELITE_DIR);
 		bind(ScheduledExecutorService.class).toInstance(new ExecutorServiceExceptionLogger(Executors.newSingleThreadScheduledExecutor()));
 		bind(OkHttpClient.class).toInstance(okHttpClient);

@@ -1,5 +1,6 @@
 package net.runelite.client.ui;
 
+import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.classic.encoder.PatternLayoutEncoder;
@@ -7,6 +8,8 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.ConsoleAppender;
 import ch.qos.logback.core.joran.spi.ConsoleTarget;
 import com.google.common.collect.Iterables;
+import java.awt.BorderLayout;
+import java.awt.LayoutManager;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
@@ -20,9 +23,11 @@ import javax.inject.Provider;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
-import javax.swing.JTextArea;
+import javax.swing.JTextPane;
 import javax.swing.SwingUtilities;
 import javax.swing.text.Document;
+import javax.swing.text.StyleConstants;
+import javax.swing.text.StyledDocument;
 import net.runelite.api.Client;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
@@ -61,11 +66,12 @@ public class ClientUITest
 		originalOut = System.out;
 		configManager = mock(ConfigManager.class);
 		eventBus = new EventBus();
+		// 最后一个参数是 --index 自定义窗口标题的覆盖值（本地改动加的），传 null 即可。
 		Constructor<ClientUI> constructor = ClientUI.class.getDeclaredConstructor(RuneLiteConfig.class, MouseManager.class,
-			Client.class, ConfigManager.class, Provider.class, EventBus.class, boolean.class, String.class);
+			Client.class, ConfigManager.class, Provider.class, EventBus.class, boolean.class, String.class, String.class);
 		constructor.setAccessible(true);
 		clientUI = constructor.newInstance(mock(RuneLiteConfig.class), null, null, configManager,
-			(Provider<ClientThread>) () -> null, eventBus, false, "Microbot");
+			(Provider<ClientThread>) () -> null, eventBus, false, "Microbot", null);
 		eventBus.register(clientUI);
 	}
 
@@ -183,16 +189,205 @@ public class ClientUITest
 		onEdt(() -> { });
 		onEdt(() -> { });
 
-		JTextArea textArea = (JTextArea) ((JScrollPane) panel.get().getComponent(0)).getViewport().getView();
+		JTextPane textPane = (JTextPane) ((JScrollPane) panel.get().getComponent(0)).getViewport().getView();
 		AtomicReference<String> text = new AtomicReference<>();
 		onEdt(() ->
 		{
-			Document document = textArea.getDocument();
+			Document document = textPane.getDocument();
 			text.set(document.getText(0, document.getLength()));
 		});
 
 		assertEquals(1, occurrences(text.get(), line));
 		assertTrue(terminal.toString(StandardCharsets.UTF_8).contains(line));
+	}
+
+	/**
+	 * 走完整链路：logback 记一条 WARN，日志框里这一行应该是 WARN 的颜色。
+	 */
+	@Test
+	public void logLinesAreColoredByTheirLevel() throws Exception
+	{
+		LoggerContext context = (LoggerContext) LoggerFactory.getILoggerFactory();
+		Logger root = context.getLogger(Logger.ROOT_LOGGER_NAME);
+
+		AtomicReference<LogConsolePanel> panel = new AtomicReference<>();
+		onEdt(() -> panel.set(new LogConsolePanel()));
+		set("consolePanel", panel.get());
+		Method initialize = ClientUI.class.getDeclaredMethod("initializeConsoleLogging");
+		initialize.setAccessible(true);
+		initialize.invoke(clientUI);
+
+		root.warn("warn probe");
+		root.info("info probe");
+		onEdt(() -> { });
+		onEdt(() -> { });
+
+		AtomicReference<java.awt.Color[]> colors = new AtomicReference<>();
+		onEdt(() ->
+		{
+			JTextPane textPane = (JTextPane) ((JScrollPane) panel.get().getComponent(0)).getViewport().getView();
+			StyledDocument document = (StyledDocument) textPane.getDocument();
+			String text = document.getText(0, document.getLength());
+			int warn = text.indexOf("warn probe");
+			int info = text.indexOf("info probe");
+			colors.set(new java.awt.Color[]{
+				StyleConstants.getForeground(document.getCharacterElement(warn).getAttributes()),
+				StyleConstants.getForeground(document.getCharacterElement(info).getAttributes())
+			});
+		});
+
+		assertEquals(LogConsolePanel.colorFor(Level.WARN), colors.get()[0]);
+		assertEquals(LogConsolePanel.colorFor(Level.INFO), colors.get()[1]);
+	}
+
+	@Test
+	public void hidingTheConsoleShrinksTheWindowBackDown() throws Exception
+	{
+		installFrameAndClient();
+		ContainableFrame frame = (ContainableFrame) get("frame");
+		try
+		{
+			onEdt(() ->
+			{
+				frame.setSize(800, 600);
+				frame.validate();
+				setConsoleVisible(true);
+				frame.validate();
+			});
+
+			int tallHeight = frame.getHeight();
+
+			onEdt(() ->
+			{
+				setConsoleVisible(false);
+				frame.validate();
+			});
+
+			int shortHeight = frame.getHeight();
+
+			assertTrue("显示 console 之后窗口应该变高，实际是 " + tallHeight + " -> " + shortHeight,
+				tallHeight > shortHeight);
+			assertTrue("隐藏 console 之后窗口应该缩回去，实际是 " + shortHeight,
+				shortHeight < tallHeight);
+		}
+		finally
+		{
+			onEdt(frame::dispose);
+		}
+	}
+
+	/**
+	 * 隐藏 console 之后窗口要回到显示之前的高度，而不是缩到最小。
+	 */
+	@Test
+	public void hidingTheConsoleRestoresTheHeightItHadBefore() throws Exception
+	{
+		installFrameAndClient();
+		ContainableFrame frame = (ContainableFrame) get("frame");
+		try
+		{
+			onEdt(() ->
+			{
+				frame.setSize(800, 600);
+				frame.validate();
+			});
+			int before = frame.getHeight();
+
+			onEdt(() ->
+			{
+				setConsoleVisible(true);
+				frame.validate();
+			});
+
+			onEdt(() ->
+			{
+				setConsoleVisible(false);
+				frame.validate();
+			});
+
+			assertEquals("隐藏 console 之后应该回到原来的高度", before, frame.getHeight());
+		}
+		finally
+		{
+			onEdt(frame::dispose);
+		}
+	}
+
+	/**
+	 * 隐藏 console 之后，画布拿回整块高度，不会被多出来的 160px 拉变形。
+	 */
+	@Test
+	public void hidingTheConsoleGivesTheCanvasItsHeightBack() throws Exception
+	{
+		installFrameAndClient();
+		ClientPanel clientPanel = (ClientPanel) get("clientPanel");
+		ContainableFrame frame = (ContainableFrame) get("frame");
+		try
+		{
+			onEdt(() -> setConsoleVisible(true));
+			int withConsole = clientPanel.getMinimumSize().height;
+
+			onEdt(() -> setConsoleVisible(false));
+			int withoutConsole = clientPanel.getMinimumSize().height;
+
+			assertTrue("隐藏之后最小高度应该变回画布本身的高度", withoutConsole < withConsole);
+		}
+		finally
+		{
+			onEdt(frame::dispose);
+		}
+	}
+
+	/**
+	 * 搭出一个带 frame、content 和 clientPanel 的环境。
+	 *
+	 * <p>不调 init() —— 它会去做一整套启动流程，而且 api.Client 接口不是 Component，
+	 * mock 不出来。这里只需要窗口布局这一块。
+	 */
+	private void installFrameAndClient() throws Exception
+	{
+		onEdt(() ->
+		{
+			ContainableFrame frame = new ContainableFrame();
+			JPanel content = new JPanel();
+			content.setLayout(createClientUiLayout());
+
+			ClientPanel clientPanel = new ClientPanel(null);
+			// 必须装上日志框，否则 clientPanel 的最小高度不会因为日志框而变大，
+			// 布局也就不会把窗口撑高。
+			clientPanel.setConsole(new LogConsolePanel());
+			clientPanel.setConsoleVisible(false);
+			content.add(clientPanel, BorderLayout.CENTER);
+			// ClientUI.Layout 会去看 content 的第二个组件 当作侧边栏
+			content.add(new JPanel(), BorderLayout.EAST);
+
+			frame.setContentPane(content);
+			frame.setSize(800, 600);
+
+			set("frame", frame);
+			set("content", content);
+			set("clientPanel", clientPanel);
+			// setConsoleVisible 一开始就会检查 consolePanel 为不为 null
+			set("consolePanel", new LogConsolePanel());
+		});
+	}
+
+	/**
+	 * ClientUI.Layout 是私有内部类，反射造一个出来 —— 窗口高度就是它算的。
+	 */
+	private LayoutManager createClientUiLayout() throws Exception
+	{
+		Class<?> layoutClass = Class.forName("net.runelite.client.ui.ClientUI$Layout");
+		Constructor<?> constructor = layoutClass.getDeclaredConstructor(ClientUI.class);
+		constructor.setAccessible(true);
+		return (LayoutManager) constructor.newInstance(clientUI);
+	}
+
+	private void setConsoleVisible(boolean visible) throws Exception
+	{
+		Method method = ClientUI.class.getDeclaredMethod("setConsoleVisible", boolean.class);
+		method.setAccessible(true);
+		method.invoke(clientUI, visible);
 	}
 
 	private void installSidebar() throws Exception

@@ -69,7 +69,7 @@ public class ConsoleLogAppenderTest
 		System.setOut(new PrintStream(new Tee(consolePanel, terminal), true, StandardCharsets.UTF_8));
 
 		ConsoleLogAppender.bindStdoutAppenders(context, terminal);
-		ConsoleLogAppender appender = new ConsoleLogAppender(console::append);
+		ConsoleLogAppender appender = new ConsoleLogAppender((level, line) -> console.append(line));
 		appender.setContext(context);
 		appender.start();
 		root.addAppender(appender);
@@ -119,7 +119,7 @@ public class ConsoleLogAppenderTest
 
 		configure();
 		System.setOut(new PrintStream(new Tee(consolePanel, terminal), true, StandardCharsets.UTF_8));
-		ConsoleLogAppender.install(context, terminal, console::append);
+		ConsoleLogAppender.install(context, terminal, (level, line) -> console.append(line));
 
 		context.reset();
 		configure();
@@ -139,7 +139,7 @@ public class ConsoleLogAppenderTest
 
 		configure();
 		System.setOut(new PrintStream(new Tee(consolePanel, terminal), true, StandardCharsets.UTF_8));
-		ConsoleLogAppender.install(context, terminal, console::append);
+		ConsoleLogAppender.install(context, terminal, (level, line) -> console.append(line));
 
 		context.reset();
 		Logger root = context.getLogger(Logger.ROOT_LOGGER_NAME);
@@ -156,7 +156,7 @@ public class ConsoleLogAppenderTest
 	@Test
 	public void stoppingTheLoggerContextDetachesTheConsoleAppender()
 	{
-		ConsoleLogAppender appender = ConsoleLogAppender.install(context, new ByteArrayOutputStream(), line -> { });
+		ConsoleLogAppender appender = ConsoleLogAppender.install(context, new ByteArrayOutputStream(), (level, line) -> { });
 
 		context.stop();
 
@@ -168,7 +168,7 @@ public class ConsoleLogAppenderTest
 	public void reconfigurationWithoutStdoutStopsSearchingAfterBoundedLines() throws JoranException
 	{
 		configure();
-		ConsoleLogAppender appender = ConsoleLogAppender.install(context, new ByteArrayOutputStream(), line -> { });
+		ConsoleLogAppender appender = ConsoleLogAppender.install(context, new ByteArrayOutputStream(), (level, line) -> { });
 
 		context.reset();
 		configure(NO_STDOUT_CONFIG);
@@ -189,7 +189,7 @@ public class ConsoleLogAppenderTest
 	{
 		StringBuilder console = new StringBuilder();
 		configure();
-		ConsoleLogAppender.install(context, new ByteArrayOutputStream(), console::append).uninstall();
+		ConsoleLogAppender.install(context, new ByteArrayOutputStream(), (level, line) -> console.append(line)).uninstall();
 
 		context.reset();
 		configure();

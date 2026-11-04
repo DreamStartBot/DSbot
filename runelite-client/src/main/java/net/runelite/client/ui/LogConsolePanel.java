@@ -4,6 +4,7 @@
  */
 package net.runelite.client.ui;
 
+import ch.qos.logback.classic.Level;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.HierarchyEvent;
@@ -17,22 +18,30 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import javax.swing.JCheckBoxMenuItem;
 import javax.swing.JMenuItem;
 import javax.swing.JPanel;
 import javax.swing.JPopupMenu;
 import javax.swing.JScrollBar;
 import javax.swing.JScrollPane;
+import javax.swing.JTextPane;
 import javax.swing.JViewport;
-import javax.swing.JTextArea;
 import javax.swing.SwingUtilities;
 import javax.swing.border.MatteBorder;
 import javax.swing.event.PopupMenuEvent;
 import javax.swing.event.PopupMenuListener;
 import javax.swing.text.BadLocationException;
-import javax.swing.text.Document;
 import javax.swing.text.DefaultCaret;
+import javax.swing.text.Document;
 import javax.swing.text.Element;
+import javax.swing.text.SimpleAttributeSet;
+import javax.swing.text.StyleConstants;
 import net.runelite.api.Constants;
+import net.runelite.client.config.ConfigManager;
 
 final class LogConsolePanel extends JPanel
 {
@@ -44,31 +53,63 @@ final class LogConsolePanel extends JPanel
 	// enough passes for a starved layout to catch up, few enough to give up on an off-screen console
 	private static final int MAX_SNAP_ATTEMPTS = 20;
 
-	private final JTextArea textArea = new JTextArea();
-	private final JScrollPane scrollPane = new JScrollPane(textArea);
+	// ===================== [MICROBOT 本地改动] 按日志等级着色 =====================
+	// 配色：ERROR 红、WARN 黄、INFO 保持原来的终端绿、DEBUG 暗灰。
+	// 背景是 DARK_GRAY_COLOR(40,40,40)，所以 DEBUG 的灰不能太暗，
+	// 用 (128,128,128) 才看得清，同时比 INFO 的绿低调。
+	// TRACE 跟 DEBUG 一样归到暗灰。
+	private static final Color ERROR_COLOR = new Color(255, 85, 85);
+	private static final Color WARN_COLOR = new Color(240, 200, 60);
+	private static final Color INFO_COLOR = new Color(0, 255, 70);
+	private static final Color DEBUG_COLOR = new Color(128, 128, 128);
+	// ===================== [MICROBOT 本地改动 END] =====================
 
-	private final StringBuilder pending = new StringBuilder();
+	// ===================== [MICROBOT 本地改动] 富文本日志框 =====================
+	// 要按行着色就得用有样式的组件，JTextArea 只有一个前景色，
+	// 换成了 JTextPane + StyledDocument。
+	private final JTextPane textPane = new JTextPane();
+	private final JScrollPane scrollPane = new JScrollPane(textPane);
+	// 每种颜色一个属性集，插入时直接复用，避免每行都新建。
+	private final Map<Color, SimpleAttributeSet> styleByColor = new HashMap<>();
+	// ===================== [MICROBOT 本地改动 END] =====================
+
+	// ===================== [MICROBOT 本地改动] 待写缓冲带上等级 =====================
+	// 原来是一个 StringBuilder，所有来源的文本混在一起。
+	// 现在按行存，每行记住自己的等级，写进文档时才能上对色。
+	private final PendingBuffer pending = new PendingBuffer();
 	private boolean flushScheduled;
+	// ===================== [MICROBOT 本地改动 END] =====================
 
 	private boolean followTail = true;
 	private boolean snapQueued;
 	private int snapAttempts;
 	private int tailCaretDot = -1;
 
+	// ===================== [MICROBOT 本地改动] 显示字段开关的持久化 =====================
+	// 勾选框的状态要存到配置里，所以要拿到 ConfigManager。
+	// 可以是 null —— 那样开关只在本次运行里生效，不落盘（测试用的就是这个构造器）。
+	// ===================== [MICROBOT 本地改动 END] =====================
+	private final ConfigManager configManager;
+
 	LogConsolePanel()
 	{
+		this(null);
+	}
+
+	LogConsolePanel(ConfigManager configManager)
+	{
 		super(new BorderLayout());
+		this.configManager = configManager;
 		setPreferredSize(new Dimension(Constants.GAME_FIXED_SIZE.width, PREFERRED_HEIGHT));
 		setBorder(new MatteBorder(1, 0, 0, 0, ColorScheme.DARKER_GRAY_COLOR));
 		setBackground(ColorScheme.DARKER_GRAY_COLOR);
 
-		textArea.setEditable(false);
-		textArea.setLineWrap(false);
-		textArea.setWrapStyleWord(false);
-		textArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-		textArea.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		textArea.setForeground(new Color(0, 255, 70));
-		textArea.setBorder(null);
+		textPane.setEditable(false);
+		textPane.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+		textPane.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		// 这是没有样式时的兜底颜色，每行的实际颜色由文档里的属性集决定。
+		textPane.setForeground(INFO_COLOR);
+		textPane.setBorder(null);
 
 		DefaultCaret caret = new DefaultCaret()
 		{
@@ -82,7 +123,7 @@ final class LogConsolePanel extends JPanel
 			}
 		};
 		caret.setUpdatePolicy(DefaultCaret.NEVER_UPDATE);
-		textArea.setCaret(caret);
+		textPane.setCaret(caret);
 
 		scrollPane.setBorder(null);
 		add(scrollPane, BorderLayout.CENTER);
@@ -98,7 +139,7 @@ final class LogConsolePanel extends JPanel
 			reconsiderFollowingTail();
 		});
 
-		textArea.addKeyListener(new KeyAdapter()
+		textPane.addKeyListener(new KeyAdapter()
 		{
 			@Override
 			public void keyPressed(KeyEvent ev)
@@ -107,7 +148,7 @@ final class LogConsolePanel extends JPanel
 				SwingUtilities.invokeLater(LogConsolePanel.this::reconsiderFollowingTail);
 			}
 		});
-		textArea.addMouseListener(new MouseAdapter()
+		textPane.addMouseListener(new MouseAdapter()
 		{
 			@Override
 			public void mousePressed(MouseEvent ev)
@@ -121,7 +162,7 @@ final class LogConsolePanel extends JPanel
 				reconsiderFollowingTail();
 			}
 		});
-		textArea.addMouseMotionListener(new MouseMotionAdapter()
+		textPane.addMouseMotionListener(new MouseMotionAdapter()
 		{
 			@Override
 			public void mouseDragged(MouseEvent ev)
@@ -154,7 +195,7 @@ final class LogConsolePanel extends JPanel
 			}
 		});
 
-		textArea.setComponentPopupMenu(buildContextMenu());
+		textPane.setComponentPopupMenu(buildContextMenu());
 
 		// opening the console lands on the newest line, wherever the view was left
 		addHierarchyListener(ev ->
@@ -195,7 +236,7 @@ final class LogConsolePanel extends JPanel
 
 	private void snapToBottom()
 	{
-		int end = textArea.getDocument().getLength();
+		int end = textPane.getDocument().getLength();
 		moveCaretToTail();
 
 		Rectangle2D newestLine;
@@ -203,7 +244,7 @@ final class LogConsolePanel extends JPanel
 		{
 			// the viewport's laid-out size trails the document, so ask the text view, which reads the
 			// newest line's position from the document itself
-			newestLine = textArea.modelToView2D(end);
+			newestLine = textPane.modelToView2D(end);
 		}
 		catch (BadLocationException | IllegalArgumentException ex)
 		{
@@ -215,7 +256,7 @@ final class LogConsolePanel extends JPanel
 			return;
 		}
 
-		textArea.scrollRectToVisible(newestLine.getBounds());
+		textPane.scrollRectToVisible(newestLine.getBounds());
 
 		JViewport viewport = scrollPane.getViewport();
 
@@ -236,6 +277,20 @@ final class LogConsolePanel extends JPanel
 	// insert schedules its own layout, and a busy script logs faster than the queue can run them.
 	void append(String text)
 	{
+		append(null, text);
+	}
+
+	// ===================== [MICROBOT 本地改动] 按等级着色 =====================
+	/**
+	 * 追加一段文本，并给每一行上色。
+	 *
+	 * @param level 这一段的日志等级。传 null 表示没有等级 ——
+	 *              脚本里直接用 System.out.println 打出来的内容就是这种，
+	 *              它们用默认的绿色显示。
+	 * @param text  文本，可能包含多行
+	 */
+	void append(Level level, String text)
+	{
 		if (text == null || text.isEmpty())
 		{
 			return;
@@ -243,13 +298,8 @@ final class LogConsolePanel extends JPanel
 
 		synchronized (pending)
 		{
-			pending.append(text, 0, text.length());
-
-			if (pending.length() > 2 * MAX_CHARACTERS_SCROLLED_UP)
-			{
-				// the oldest buffered lines would be trimmed out of the document on arrival anyway
-				pending.delete(0, lineStartAtOrAfter(pending, pending.length() - MAX_CHARACTERS_SCROLLED_UP));
-			}
+			pending.add(level, text);
+			pending.trimTo(MAX_CHARACTERS_SCROLLED_UP);
 
 			if (flushScheduled)
 			{
@@ -261,6 +311,15 @@ final class LogConsolePanel extends JPanel
 		SwingUtilities.invokeLater(this::flushPending);
 	}
 
+	/**
+	 * 丢掉最前面几行，直到剩下的字符数不超过上限。
+	 *
+	 * <p>按整行丢，不能丢半行 —— 半行会拼出乱七八糟的内容。
+	 */
+	// ===================== [MICROBOT 本地改动 END] =====================
+
+	// 待写缓冲改成按行存之后，这个方法在生产代码里暂时没人用了，
+	// 但它是上游留下来的行边界工具，留着以免跟上游同步时多一处冲突。
 	static int lineStartAtOrAfter(CharSequence text, int from)
 	{
 		if (from <= 0)
@@ -283,36 +342,35 @@ final class LogConsolePanel extends JPanel
 
 	private void flushPending()
 	{
-		String text;
+		List<PendingLine> batch;
 		synchronized (pending)
 		{
 			flushScheduled = false;
-			if (pending.length() == 0)
+			if (pending.isEmpty())
 			{
 				return;
 			}
 
 			int cap = followTail ? MAX_CHARACTERS : MAX_CHARACTERS_SCROLLED_UP;
-			text = pending.substring(lineStartAtOrAfter(pending, pending.length() - cap));
-			pending.setLength(0);
+			batch = pending.drain(cap);
 		}
 
-		appendOnEdt(text.replace("\r", ""));
+		appendOnEdt(batch);
 	}
 
 	private JPopupMenu buildContextMenu()
 	{
 		JPopupMenu menu = new JPopupMenu();
 		JMenuItem copy = new JMenuItem("Copy");
-		copy.addActionListener(ev -> textArea.copy());
+		copy.addActionListener(ev -> textPane.copy());
 		JMenuItem copyAll = new JMenuItem("Copy all");
-		copyAll.addActionListener(ev -> copyToClipboard(textArea.getText()));
+		copyAll.addActionListener(ev -> copyToClipboard(textPane.getText()));
 		JMenuItem selectAll = new JMenuItem("Select all");
 		selectAll.addActionListener(ev ->
 		{
 			followTail = false;
-			textArea.requestFocusInWindow();
-			textArea.selectAll();
+			textPane.requestFocusInWindow();
+			textPane.selectAll();
 		});
 		JMenuItem clear = new JMenuItem("Clear");
 		clear.addActionListener(ev -> clear());
@@ -321,16 +379,43 @@ final class LogConsolePanel extends JPanel
 		menu.add(selectAll);
 		menu.addSeparator();
 		menu.add(clear);
+
+		// ===================== [MICROBOT 本地改动] 显示字段开关 =====================
+		// 日志等级和类名做成可勾选的，默认都不显示，每行只留时间和消息。
+		JCheckBoxMenuItem showLevel = new JCheckBoxMenuItem("Show log level");
+		showLevel.addActionListener(ev ->
+		{
+			boolean selected = showLevel.isSelected();
+			ConsoleLogAppender.setShowLevel(selected);
+			persist(ClientUI.CONFIG_CLIENT_CONSOLE_SHOW_LEVEL, selected);
+		});
+		JCheckBoxMenuItem showLogger = new JCheckBoxMenuItem("Show logger name");
+		showLogger.addActionListener(ev ->
+		{
+			boolean selected = showLogger.isSelected();
+			ConsoleLogAppender.setShowLogger(selected);
+			persist(ClientUI.CONFIG_CLIENT_CONSOLE_SHOW_LOGGER, selected);
+		});
+		menu.addSeparator();
+		menu.add(showLevel);
+		menu.add(showLogger);
+		// ===================== [MICROBOT 本地改动 END] =====================
+
 		menu.addPopupMenuListener(new PopupMenuListener()
 		{
 			@Override
 			public void popupMenuWillBecomeVisible(PopupMenuEvent ev)
 			{
-				copy.setEnabled(textArea.getSelectionStart() != textArea.getSelectionEnd());
-				boolean hasText = textArea.getDocument().getLength() > 0;
+				copy.setEnabled(textPane.getSelectionStart() != textPane.getSelectionEnd());
+				boolean hasText = textPane.getDocument().getLength() > 0;
 				copyAll.setEnabled(hasText);
 				selectAll.setEnabled(hasText);
 				clear.setEnabled(hasText);
+				// ===================== [MICROBOT 本地改动] 同步勾选状态 =====================
+				// 开关可能已经被别处改过了，弹出时按当前实际状态显示。
+				showLevel.setSelected(ConsoleLogAppender.isShowLevel());
+				showLogger.setSelected(ConsoleLogAppender.isShowLogger());
+				// ===================== [MICROBOT 本地改动 END] =====================
 			}
 
 			@Override
@@ -346,6 +431,24 @@ final class LogConsolePanel extends JPanel
 		return menu;
 	}
 
+	// ===================== [MICROBOT 本地改动] 显示字段开关的持久化 =====================
+	/**
+	 * 把开关状态存进配置。
+	 *
+	 * @param key 配置的键
+	 * @param value 开关状态
+	 */
+	private void persist(String key, boolean value)
+	{
+		if (configManager == null)
+		{
+			return;
+		}
+
+		configManager.setConfiguration(ClientUI.CONFIG_GROUP, key, value);
+	}
+	// ===================== [MICROBOT 本地改动 END] =====================
+
 	private static void copyToClipboard(String text)
 	{
 		Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
@@ -355,16 +458,16 @@ final class LogConsolePanel extends JPanel
 	{
 		synchronized (pending)
 		{
-			pending.setLength(0);
+			pending.clear();
 		}
 
 		if (SwingUtilities.isEventDispatchThread())
 		{
-			textArea.setText("");
+			textPane.setText("");
 		}
 		else
 		{
-			SwingUtilities.invokeLater(() -> textArea.setText(""));
+			SwingUtilities.invokeLater(() -> textPane.setText(""));
 		}
 	}
 
@@ -373,14 +476,36 @@ final class LogConsolePanel extends JPanel
 		return new ConsoleOutputStream();
 	}
 
-	private void appendOnEdt(String text)
+	// ===================== [MICROBOT 本地改动] 按等级着色 =====================
+	/**
+	 * 把一批带等级的行走进文档。
+	 *
+	 * <p>连续的同等级行合并成一次插入，文档改动次数少了性能才撑得住高频日志。
+	 */
+	private void appendOnEdt(List<PendingLine> batch)
 	{
-		Document document = textArea.getDocument();
+		Document document = textPane.getDocument();
 		try
 		{
 			boolean atBottom = followTail;
 			int length = document.getLength();
-			document.insertString(length, text, null);
+
+			int i = 0;
+			while (i < batch.size())
+			{
+				Level level = batch.get(i).level;
+				StringBuilder chunk = new StringBuilder();
+				while (i < batch.size() && batch.get(i).level == level)
+				{
+					chunk.append(batch.get(i).text);
+					i++;
+				}
+
+				String text = chunk.toString().replace("\r", "");
+				document.insertString(length, text, attributesFor(level));
+				length += text.length();
+			}
+
 			trimIfNecessary(atBottom);
 			if (atBottom)
 			{
@@ -397,10 +522,152 @@ final class LogConsolePanel extends JPanel
 		}
 	}
 
+	/**
+	 * 取某个等级对应的文字样式。样式按颜色缓存，每种颜色只建一次。
+	 */
+	private SimpleAttributeSet attributesFor(Level level)
+	{
+		Color color = colorFor(level);
+		return styleByColor.computeIfAbsent(color, c ->
+		{
+			SimpleAttributeSet attributes = new SimpleAttributeSet();
+			StyleConstants.setForeground(attributes, c);
+			// 字体跟着组件走，免得富文本组件用默认字体把等宽的排版打乱。
+			Font font = textPane.getFont();
+			if (font != null)
+			{
+				StyleConstants.setFontFamily(attributes, font.getFamily());
+				StyleConstants.setFontSize(attributes, font.getSize());
+			}
+			return attributes;
+		});
+	}
+
+	/**
+	 * 等级到颜色的映射。
+	 *
+	 * <p>ERROR 红、WARN 黄、INFO 绿、DEBUG（和 TRACE）暗灰。
+	 * 没有等级的输出按 INFO 的绿色处理。
+	 */
+	static Color colorFor(Level level)
+	{
+		if (level == null)
+		{
+			return INFO_COLOR;
+		}
+
+		switch (level.toInt())
+		{
+			case Level.ERROR_INT:
+				return ERROR_COLOR;
+			case Level.WARN_INT:
+				return WARN_COLOR;
+			case Level.INFO_INT:
+				return INFO_COLOR;
+			default:
+				return DEBUG_COLOR;
+		}
+	}
+	// ===================== [MICROBOT 本地改动 END] =====================
+
+	/**
+	 * 待写缓冲里的一行，连着它的日志等级。
+	 */
+	private static final class PendingLine
+	{
+		private final Level level;
+		private final String text;
+
+		private PendingLine(Level level, String text)
+		{
+			this.level = level;
+			this.text = text;
+		}
+	}
+
+	/**
+	 * 待写缓冲：按行存，每行记住自己的等级。
+	 *
+	 * <p>顺手记着总字符数，这样判断要不要裁剪不用每次都遍历一遍 ——
+	 * 高频日志下每来一行都遍历整个缓冲会变成平方级的开销。
+	 */
+	private static final class PendingBuffer
+	{
+		private final List<PendingLine> lines = new ArrayList<>();
+		private int chars;
+
+		/**
+		 * 把文本按换行拆成一行一行加进来，每行记住自己的等级。
+		 * 换行符留在行尾，拼回去还是原来的样子。
+		 */
+		void add(Level level, String text)
+		{
+			int start = 0;
+			int length = text.length();
+			while (start < length)
+			{
+				int newline = text.indexOf('\n', start);
+				String line = newline < 0
+					? text.substring(start)
+					: text.substring(start, newline + 1);
+				lines.add(new PendingLine(level, line));
+				chars += line.length();
+				if (newline < 0)
+				{
+					return;
+				}
+				start = newline + 1;
+			}
+		}
+
+		/**
+		 * 丢掉最前面几行，直到剩下的字符数不超过上限。
+		 *
+		 * <p>按整行丢，不能丢半行 —— 半行会拼出乱七八糟的内容。
+		 */
+		void trimTo(int cap)
+		{
+			if (chars <= cap)
+			{
+				return;
+			}
+
+			int excess = chars - cap;
+			int dropped = 0;
+			while (dropped < lines.size() && excess > 0)
+			{
+				excess -= lines.get(dropped).text.length();
+				chars -= lines.get(dropped).text.length();
+				dropped++;
+			}
+			lines.subList(0, dropped).clear();
+		}
+
+		boolean isEmpty()
+		{
+			return lines.isEmpty();
+		}
+
+		List<PendingLine> drain(int cap)
+		{
+			trimTo(cap);
+			List<PendingLine> batch = new ArrayList<>(lines);
+			lines.clear();
+			chars = 0;
+			return batch;
+		}
+
+		void clear()
+		{
+			lines.clear();
+			chars = 0;
+		}
+	}
+
 	private void moveCaretToTail()
 	{
-		tailCaretDot = textArea.getDocument().getLength();
-		textArea.setCaretPosition(tailCaretDot);
+		tailCaretDot = textPane.getDocument().getLength();
+		textPane.setCaretPosition(tailCaretDot);
 	}
 
 	// Deferred so the user's gesture has reached the scrollbar before it is read.
@@ -408,7 +675,7 @@ final class LogConsolePanel extends JPanel
 	{
 		SwingUtilities.invokeLater(() ->
 		{
-			followTail = isScrolledToBottom() && textArea.getSelectionStart() == textArea.getSelectionEnd();
+			followTail = isScrolledToBottom() && textPane.getSelectionStart() == textPane.getSelectionEnd();
 			if (followTail)
 			{
 				snapAttempts = 0;
@@ -425,7 +692,7 @@ final class LogConsolePanel extends JPanel
 
 	private void trimIfNecessary(boolean atBottom)
 	{
-		Document document = textArea.getDocument();
+		Document document = textPane.getDocument();
 		int excess = document.getLength() - (atBottom ? MAX_CHARACTERS : MAX_CHARACTERS_SCROLLED_UP);
 		if (excess <= 0)
 		{

@@ -118,6 +118,30 @@ public class MicrobotPlugin extends Plugin
 	@Inject
 	private ClientToolbar clientToolbar;
 
+	// ===================== [MICROBOT 本地改动] 禁用输入开关可注入 =====================
+	// 本地新增：注入 InputSelector 单例。
+	//
+	// 上游原本是 `new InputSelector(clientToolbar);` —— 创建完就把引用丢了，
+	// 外部拿不到这个开关。改成可注入的单例之后，工具栏按钮组
+	// （ToolbarButtonsPlugin）才能在脚本启停时开关「禁用输入」。
+	//
+	// 冲突时如何覆盖：保留这个字段。
+	// ===================== [MICROBOT 本地改动 END] =====================
+	@Inject
+	private InputSelector inputSelector;
+
+	// ===================== [MICROBOT 本地改动] --script 启动指定脚本 =====================
+	// 本地新增：注入命令行脚本启动器。
+	//
+	// 启动器负责按 --script 传的名字找到 side-load 脚本并拉起来。
+	// 脚本名通过 RuneLiteModule 的 @Named("scriptName") 绑定传进来，
+	// 详见 RuneLiteModule.java 中标注 MICROBOT 本地改动 的位置。
+	//
+	// 冲突时如何覆盖：保留这个字段。
+	// ===================== [MICROBOT 本地改动 END] =====================
+	@Inject
+	private CommandLineScriptLauncher commandLineScriptLauncher;
+
 	@Inject
 	private ConfigManager configManager;
 
@@ -265,7 +289,17 @@ public class MicrobotPlugin extends Plugin
 
 		clientToolbar.addNavigation(navButton);
 
-		new InputSelector(clientToolbar);
+		// ===================== [MICROBOT 本地改动] 禁用输入开关可注入 =====================
+		// 上游原本是 `new InputSelector(clientToolbar);` —— 构造里就 startUp()，
+		// 往工具栏上挂「Enable Input / Disable Input」那两个按钮。
+		//
+		// 本地改成注入单例后显式调 startUp()，行为不变（按钮还是在这儿挂），
+		// 区别是这个实例现在外部也拿得到。
+		//
+		// 冲突时如何覆盖：保留 `inputSelector.startUp();` 这一行，
+		// 删掉上游的 `new InputSelector(clientToolbar);`。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		inputSelector.startUp();
 		helpMenu.install();
 		bugReportTracker.start();
 		eventBus.register(tour);
@@ -274,6 +308,21 @@ public class MicrobotPlugin extends Plugin
 		Microbot.getPouchScript().startUp();
 
 		Rs2Walker.setSeasonalTransportHandlers(SeasonalTransportHandlers.defaultHandlerList());
+
+		// ===================== [MICROBOT 本地改动] --script 启动指定脚本 =====================
+		// 上游原本没有这个功能：命令行只能影响窗口标题、代理这些，
+		// 要跑脚本得手动点工具栏的「启动」按钮。
+		//
+		// 本地新增 --script 参数，客户端启动完就把指定名字的 side-load 脚本拉起来。
+		// 放在这里是因为 MicrobotPlugin 是 always-on 插件，一定会被启动，
+		// 而且到这一步 side-load 的 jar 早就加载完了（见 RuneLite.start()）。
+		//
+		// 启动动作在 EDT 上同步做完 —— PluginManager.startPlugin 有这个断言。
+		//
+		// 冲突时如何覆盖：保留这两行。上游若也加了类似参数，
+		// 保留上游的注入方式，本地只保留这里的调用。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		commandLineScriptLauncher.launch();
 
 		if (overlayManager != null)
 		{

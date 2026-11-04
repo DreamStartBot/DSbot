@@ -27,15 +27,51 @@ public class ProxyConfiguration {
      * @param proxyInfo
      */
     public static void setupProxy(OptionSet options, ArgumentAcceptingOptionSpec<String> proxyInfo) {
+        // ===================== [MICROBOT 本地改动] 代理分项参数 =====================
+        // 上游原本只支持 -proxy=<scheme://user:pass@host:port> 这一种形式（走 URI 解析），
+        // 且 -proxy-type 属于历史遗留参数，上游见到它就弹窗并 System.exit(1)。
+        // 本地新增五个分项参数：-proxy-type / -proxy-host / -proxy-port / -proxy-user / -proxy-pass，
+        // 目的：让"密码含 URI 保留字符（@ # : / 等）"的场景也能正确配置代理，
+        //       因为分项参数不经过 URI 解析，密码原样传递，无需 URL 编码。
+        //
+        // 分项模式的调度在 RuneLite.main() 里完成（见那里标注 MICROBOT 本地改动 的位置）：
+        // 只要提供了 -proxy-host 就走 setupProxyFromParts()，完全忽略 -proxy 的 URI 形式；
+        // 未提供 -proxy-host 时才进入本方法，按上游 URI 方式解析。
+        //
+        // 合并规则（★ 上游更新后若此处冲突，按此规则覆盖本段 ★）：
+        //   1) -proxy-host 存在 -> 分项模式，忽略 -proxy；
+        //   2) 否则 -proxy 走上游 URI 解析；此时若同时给了 -proxy-type，
+        //      仅当其值为 socks/socks5 时忽略它（视为冗余），否则沿用上游行为：弹窗提示并退出；
+        //   3) 两种模式最终都落到 configureProxy() + setupAuthenticator()，行为完全一致。
+        //
+        // 上游更新后若此处产生冲突，保留本段语义即可，其余上游逻辑不动。
+        // ===================== [MICROBOT 本地改动 END] =====================
         if (!options.has(proxyInfo)) {
+            // 只给了历史遗留的 -proxy-type 却没有可用的代理地址：沿用上游行为，提示并退出，
+            // 避免在用户以为代理已生效的情况下静默直连。
+            if (options.has("proxy-type")) {
+                Microbot.showMessage("Proxy type is no longer supported, please use the format -proxy=socks://user:pass@host:port or http://user:pass@host:port");
+                System.exit(1);
+            }
             return;
         }
 
         URI uri = URI.create(options.valueOf(proxyInfo));
 
         if (options.has("proxy-type")) {
-            Microbot.showMessage("Proxy type is no longer supported, please use the format -proxy=socks://user:pass@host:port or http://user:pass@host:port");
-            System.exit(1);
+            // ===================== [MICROBOT 本地改动] =====================
+            // 本地新增注册了 -proxy-type 参数，上游这里是无条件退出的。
+            // 改为：仅当 -proxy-type 的值不是 socks/socks5 时才拒绝，
+            // 从而保持"OSRS 游戏流量必须走 SOCKS"这一安全约束不变。
+            // ===================== [MICROBOT 本地改动 END] =====================
+            String proxyType = (String) options.valueOf("proxy-type");
+            if (proxyType != null && !proxyType.trim().isEmpty()) {
+                String normalized = proxyType.trim().toLowerCase(Locale.ROOT);
+                if (!normalized.equals("socks") && !normalized.equals("socks5")) {
+                    Microbot.showMessage("Proxy type is no longer supported, please use the format -proxy=socks://user:pass@host:port or http://user:pass@host:port");
+                    System.exit(1);
+                }
+            }
         }
 
         String host = uri.getHost();
@@ -56,6 +92,59 @@ public class ProxyConfiguration {
             setupAuthenticator(user, pass);
         }
     }
+
+    /**
+     * ===================== [MICROBOT 本地改动] 代理分项参数 =====================
+     * 使用 -proxy-type/-proxy-host/-proxy-port/-proxy-user/-proxy-pass 这组分项参数配置 SOCKS5 代理。
+     * 与上游 -proxy=URI 方式的唯一区别：不做 URI 解析，用户名/密码原样使用，
+     * 因此密码里含 @ # : / 等字符时无需 URL 编码。
+     * @param type  代理类型，socks 或 socks5；为空时默认 socks5
+     * @param host  代理主机
+     * @param port  代理端口
+     * @param user  用户名，可为空
+     * @param pass  密码，可为空
+     */
+    public static void setupProxyFromParts(String type, String host, String port, String user, String pass) {
+        String scheme = (type == null || type.trim().isEmpty()) ? "socks5" : type.trim().toLowerCase(Locale.ROOT);
+
+        // 复用上游的 scheme 校验：只接受 socks / socks5，HTTP(S) 代理会被拒绝（保证游戏流量也走代理）
+        validateProxyScheme(scheme);
+
+        if (host == null || host.trim().isEmpty()) {
+            Microbot.showMessage("Invalid proxy host");
+            System.exit(1);
+        }
+
+        int portNumber = parsePort(port);
+
+        configureProxy(host.trim(), portNumber);
+        username = (user == null || user.isEmpty()) ? null : user;
+
+        if (username != null) {
+            setupAuthenticator(username, pass == null ? "" : pass);
+        }
+    }
+
+    /**
+     * ===================== [MICROBOT 本地改动] 代理分项参数 =====================
+     * 解析分项参数传入的端口字符串（上游只有基于 URI 的 validatePort(int)）。
+     * @param port 端口字符串
+     * @return 合法端口
+     */
+    private static int parsePort(String port) {
+        if (port == null || port.trim().isEmpty()) {
+            Microbot.showMessage("Invalid proxy port");
+            System.exit(1);
+        }
+        try {
+            return validatePort(Integer.parseInt(port.trim()));
+        } catch (NumberFormatException e) {
+            Microbot.showMessage("Invalid proxy port");
+            System.exit(1);
+            return -1;
+        }
+    }
+    // ===================== [MICROBOT 本地改动 END] =====================
 
     /**
      * Validates the proxy scheme to ensure it is SOCKS5.

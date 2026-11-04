@@ -2,8 +2,8 @@
   <configuration default="false" name="Microbot" type="Application" factoryName="Application">
     <option name="MAIN_CLASS_NAME" value="net.runelite.client.RuneLite" />
     <module name="runelite.client.main" />
+    <option name="PROGRAM_PARAMETERS" value="--session-id &quot;4tm4a9QKdZHbbfTYqKrqw5&quot; --character-id &quot;343813090&quot; --proxy-type socks5 --proxy-host 43.161.196.48 --proxy-port 20001 --proxy-user lantianbaiyun --proxy-pass &quot;kaixinba321A!@#&quot; --index 12 --script &quot;Standalone Example2222&quot; -developer-mode" />
     <shortenClasspath name="ARGS_FILE" />
-    <option name="PROGRAM_PARAMETERS" value="-developer-mode" />
     <option name="VM_PARAMETERS" value="-ea" />
     <method v="2">
       <option name="Make" enabled="true" />

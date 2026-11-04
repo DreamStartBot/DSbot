@@ -98,12 +98,23 @@ import static javax.swing.JOptionPane.INFORMATION_MESSAGE;
 @Singleton
 public class ClientUI
 {
-	private static final String CONFIG_GROUP = "runelite";
+	// ===================== [MICROBOT 本地改动] 配置组对外可见 =====================
+	// LogConsolePanel 要把「显示等级 / 显示类名」的开关状态存进同一个配置组，
+	// 所以这里从 private 改成包内可见，避免 group 名字写两遍。
+	// 冲突时如何覆盖：改回 private，并把 LogConsolePanel 里的引用换成本类的常量。
+	// ===================== [MICROBOT 本地改动 END] =====================
+	static final String CONFIG_GROUP = "runelite";
 	private static final String CONFIG_CLIENT_BOUNDS = "clientBounds";
 	private static final String CONFIG_CLIENT_MAXIMIZED = "clientMaximized";
 	private static final String CONFIG_CLIENT_SIDEBAR_CLOSED = "clientSidebarClosed";
 	private static final String CONFIG_CLIENT_SIDEBAR_TAB = "clientSidebarTab";
 	private static final String CONFIG_CLIENT_CONSOLE_OPEN = "clientConsoleOpen";
+	// ===================== [MICROBOT 本地改动] 日志显示字段开关 =====================
+	// 日志框里要不要显示日志等级和类名，默认都不显示。
+	// 冲突时如何覆盖：保留这两个键。
+	// ===================== [MICROBOT 本地改动 END] =====================
+	static final String CONFIG_CLIENT_CONSOLE_SHOW_LEVEL = "clientConsoleShowLevel";
+	static final String CONFIG_CLIENT_CONSOLE_SHOW_LOGGER = "clientConsoleShowLogger";
 	public static final BufferedImage ICON_128 = ImageUtil.loadImageResource(Microbot.class, "microbot_logo.png");
 	public static final BufferedImage ICON_16 = ImageUtil.loadImageResource(Microbot.class, "microbot_logo.png");
 	public static String proxyMessage = "";
@@ -119,6 +130,17 @@ public class ClientUI
 	private final EventBus eventBus;
 	private final boolean safeMode;
 	private final String title;
+	// ===================== [MICROBOT 本地改动] --index 自定义窗口标题 =====================
+	// 本地新增：--index 启动参数传入的窗口标题覆盖值。
+	// windowTitleOverride —— 原始字符串，未指定时为空串。
+	// windowTitleOverridden —— 是否传入了 --index。用于关闭默认的「标题 + 玩家名」逻辑。
+	// windowTitleOverrideApplied —— 标题是否已经真正被设置过。用于让 updateFrameConfig 每次都把标题盖回自定义值。
+	//   它在 EDT 上写、在 client 线程上读，所以声明为 volatile 保证可见性。
+	// 详见 RuneLite.java 中标注 MICROBOT 本地改动 的位置。
+	// ===================== [MICROBOT 本地改动 END] =====================
+	private final String windowTitleOverride;
+	private final boolean windowTitleOverridden;
+	private volatile boolean windowTitleOverrideApplied;
 
 	private final Rectangle sidebarButtonPosition = new Rectangle();
 	private BufferedImage sidebarOpenIcon;
@@ -185,7 +207,13 @@ public class ClientUI
 		Provider<ClientThread> clientThreadProvider,
 		EventBus eventBus,
 		@Named("safeMode") boolean safeMode,
-		@Named("runelite.title") String title
+		@Named("runelite.title") String title,
+		// ===================== [MICROBOT 本地改动] --index 自定义窗口标题 =====================
+		// 本地新增的注入参数：--index 传入的窗口标题覆盖值。
+		// 放在构造器最后一个参数，避免影响其它注入。
+		// 上游更新后若此处冲突，保留这个参数即可。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		@Named("windowTitleOverride") String windowTitleOverride
 	)
 	{
 		this.config = config;
@@ -196,6 +224,11 @@ public class ClientUI
 		this.eventBus = eventBus;
 		this.safeMode = safeMode;
 		this.title = title + (safeMode ? " (safe mode)" : "");
+		// ===================== [MICROBOT 本地改动] --index 自定义窗口标题 =====================
+		// 空串表示未指定 --index，此时行为与上游完全一致。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		this.windowTitleOverride = windowTitleOverride;
+		this.windowTitleOverridden = !Strings.isNullOrEmpty(windowTitleOverride);
 
 		normalBoundsTimer = new Timer(250, _ev -> setLastNormalBounds());
 		normalBoundsTimer.setRepeats(false);
@@ -302,7 +335,11 @@ public class ClientUI
 	@Subscribe
 	private void onGameStateChanged(final GameStateChanged event)
 	{
-		if (event.getGameState() != GameState.LOGGED_IN || !config.usernameInTitle())
+		// ===================== [MICROBOT 本地改动] --index 自定义窗口标题 =====================
+		// 传入了 --index 时跳过，不追加玩家名：自定义标题是最终字符串，不再拼接。
+		// 上游更新后若此处冲突，保留 windowTitleOverridden 这个短路条件即可。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		if (event.getGameState() != GameState.LOGGED_IN || windowTitleOverridden || !config.usernameInTitle())
 		{
 			return;
 		}
@@ -436,7 +473,10 @@ public class ClientUI
 			content.setLayout(new Layout());
 
 			clientPanel = new ClientPanel(client);
-			consolePanel = new LogConsolePanel();
+			// ===================== [MICROBOT 本地改动] 日志框拿到 ConfigManager =====================
+			// 右键菜单里的显示开关要能存进配置。
+			// ===================== [MICROBOT 本地改动 END] =====================
+			consolePanel = new LogConsolePanel(configManager);
 			clientPanel.setConsole(consolePanel);
 			clientPanel.setConsoleVisible(false);
 			consoleVisible = false;
@@ -769,6 +809,15 @@ public class ClientUI
 
 			// Show frame
 			frame.setVisible(true);
+			// ===================== [MICROBOT 本地改动] --index 自定义窗口标题 =====================
+			// 自定义标题必须在窗口显示之后才轮询设置，不能放在显示之前：
+			// 游戏可能尚未加载成功甚至加载失败，那样标题会先一步显示出来骗人。
+			// 上游更新后若此处冲突，保留这三行即可。
+			// ===================== [MICROBOT 本地改动 END] =====================
+			if (windowTitleOverridden)
+			{
+				scheduleWindowTitleOnLoggedIn();
+			}
 			// On macos setResizable needs to be called after setVisible
 			frame.setResizable(!config.lockWindowSize());
 			frame.toFront();
@@ -813,6 +862,57 @@ public class ClientUI
 			});
 		}
 	}
+
+	// ===================== [MICROBOT 本地改动] --index 自定义窗口标题 =====================
+	/**
+	 * 等游戏引擎启动后再应用 --index 自定义窗口标题。
+	 *
+	 * <p>若超时（默认 60 秒）仍未启动，则放弃并保持默认标题。
+	 * 该方法必须在 show() 中 frame.setVisible(true) 之后调用一次。
+	 *
+	 * <p>用 ClientThread.invokeLater(BooleanSupplier) 轮询游戏引擎状态：
+	 * 返回 false 会在下一个 client tick 重新执行，返回 true 表示结束。
+	 */
+	private void scheduleWindowTitleOnLoggedIn()
+	{
+		final long startTime = System.currentTimeMillis();
+		final long TIMEOUT_MS = 60_000L;
+
+		clientThreadProvider.get().invokeLater(() ->
+		{
+			// 已经应用过则停止轮询
+			if (windowTitleOverrideApplied)
+			{
+				return true;
+			}
+			// 超时则放弃，保持默认标题
+			if (System.currentTimeMillis() - startTime > TIMEOUT_MS)
+			{
+				log.debug("Timed out waiting for game engine to start; keeping default window title");
+				return true;
+			}
+			// client 字段类型为 Component，需强转为 Client 才能调用 getGameState()
+			// 引擎活着就算加载成功：UNKNOWN/STARTING 表示引擎尚未启动，继续等待；
+			// 其他状态（LOGIN_SCREEN 及之后）都认为加载成功，可以应用自定义标题。
+			final Client gameClient = (Client) client;
+			if (gameClient == null || gameClient.getGameState() == GameState.UNKNOWN || gameClient.getGameState() == GameState.STARTING)
+			{
+				return false; // 引擎还没启动，下一 tick 再试
+			}
+			// 切回 EDT 线程设置窗口标题（setTitle 是 Swing 调用）
+			SwingUtilities.invokeLater(() ->
+			{
+				if (!windowTitleOverrideApplied)
+				{
+					windowTitleOverrideApplied = true;
+					frame.setTitle(windowTitleOverride);
+					log.debug("Applied window title override after game engine loaded: {}", windowTitleOverride);
+				}
+			});
+			return true;
+		});
+	}
+	// ===================== [MICROBOT 本地改动 END] =====================
 
 	private boolean dispatchWindowKeyEvent(KeyEvent ev)
 	{
@@ -1356,6 +1456,13 @@ public class ClientUI
 		consoleVisible = visible;
 		if (visible)
 		{
+			// ===================== [MICROBOT 本地改动] 记下显示前的窗口高度 =====================
+			// 隐藏的时候要恢复到这个高度。
+			// ===================== [MICROBOT 本地改动 END] =====================
+			if (frame != null)
+			{
+				consolePreShowHeight = frame.getHeight();
+			}
 			configManager.setConfiguration(CONFIG_GROUP, CONFIG_CLIENT_CONSOLE_OPEN, true);
 		}
 		else
@@ -1364,6 +1471,33 @@ public class ClientUI
 		}
 		clientPanel.setConsoleVisible(visible);
 		updateConsoleToggleButton();
+
+		// ===================== [MICROBOT 本地改动] 隐藏 console 时把窗口缩回去 =====================
+		// 隐藏的时候要把 content 的高度先压回去。
+		//
+		// 上游这里只做了 revalidate，没有恢复尺寸。而 Layout.layout() 里的
+		//   innerHeight = Math.max(content.getHeight() - insetHeight, client.getMinimumSize().height)
+		// 是只增不减的 —— content 的高度不先降下来，下一次布局会把它又撑回
+		// 撑高后的值，窗口就永远缩不回去，画布还会被拉高变形。
+		//
+		// 隐藏时目标高度取「刚好装下游戏画布」的最小高度，
+		// 也就是 console 占掉的那 160px 原样还回去。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		if (!visible)
+		{
+			shrinkToClientHeight();
+
+			// 布局是异步的：content.revalidate() 触发的布局可能在我们缩回去之后才跑，
+			// 那次布局会用撑高后的 content 高度把窗口又顶回去。
+			// 所以布局跑完之后再收一次。
+			SwingUtilities.invokeLater(() ->
+			{
+				if (!consoleVisible)
+				{
+					shrinkToClientHeight();
+				}
+			});
+		}
 
 		if (content != null)
 		{
@@ -1376,6 +1510,80 @@ public class ClientUI
 			frame.revalidateMinimumSize();
 		}
 	}
+
+	// ===================== [MICROBOT 本地改动] 隐藏 console 时把窗口缩回去 =====================
+	// 隐藏的时候要把 content 的高度先压回去。
+	//
+	// 上游这里只做了 revalidate，没有恢复尺寸。而 Layout.layout() 里的
+	//   innerHeight = Math.max(content.getHeight() - insetHeight, client.getMinimumSize().height)
+	// 是只增不减的 —— content 的高度不先降下来，下一次布局会把它又撑回
+	// 撑高后的值，窗口就永远缩不回去，画布还会被拉高变形。
+	//
+	// 隐藏时优先把窗口恢复到「显示 console 之前的高度」；
+	// 没有记录时退回到「刚好装下游戏画布」的最小高度。
+	// ===================== [MICROBOT 本地改动 END] =====================
+	private Integer consolePreShowHeight;
+
+	// ===================== [MICROBOT 本地改动] 隐藏 console 时把窗口缩回去 =====================
+	/**
+	 * 把窗口高度恢复到显示 console 之前的状态。
+	 *
+	 * <p>两件事都要做：
+	 * <ol>
+	 *   <li>把 content 的高度压回最小，否则 {@code Layout.layout()} 里的
+	 *       {@code Math.max} 会把撑高后的高度保下来；</li>
+	 *   <li>把窗口本身缩回去。</li>
+	 * </ol>
+	 */
+	private void shrinkToClientHeight()
+	{
+		if (content == null || frame == null || clientPanel == null)
+		{
+			return;
+		}
+
+		Insets insets = content.getInsets();
+		Dimension clientMin = clientPanel.getMinimumSize();
+		int targetContentHeight = clientMin.height + insets.top + insets.bottom;
+
+		// content 的高度必须先压回去
+		content.setSize(content.getWidth(), targetContentHeight);
+		content.setPreferredSize(content.getSize());
+
+		frame.revalidateMinimumSize();
+
+		// 最大化的时候不要去改窗口尺寸，但 content 的高度已经压回去了，
+		// 画布不会变形。
+		if ((frame.getExtendedState() & Frame.MAXIMIZED_BOTH) == Frame.MAXIMIZED_BOTH)
+		{
+			return;
+		}
+
+		Rectangle oldBounds = frame.getBounds();
+		int targetHeight;
+
+		if (consolePreShowHeight != null && consolePreShowHeight > 0)
+		{
+			// 恢复显示 console 之前的高度
+			targetHeight = consolePreShowHeight;
+		}
+		else
+		{
+			// 没有记录就用「刚好装下画布」的最小高度
+			Insets frameInsets = frame.getInsets();
+			targetHeight = targetContentHeight + frameInsets.top + frameInsets.bottom;
+		}
+
+		frame.containedSetSize(new Dimension(oldBounds.width, targetHeight), oldBounds);
+
+		// ===================== [MICROBOT 本地改动] 诊断日志 =====================
+		// 临时用 log.info，方便在日志框里直接看到尺寸变化。
+		log.info("[console] 隐藏日志框: clientMin={} content高 {} -> {}，窗口高 {} -> {}（目标 {}），最大化={}",
+			clientMin, oldBounds.height, targetHeight, frame.getHeight(), frame.getHeight(), targetHeight,
+			(frame.getExtendedState() & Frame.MAXIMIZED_BOTH) == Frame.MAXIMIZED_BOTH);
+		// ===================== [MICROBOT 本地改动 END] =====================
+	}
+	// ===================== [MICROBOT 本地改动 END] =====================
 
 	private void updateConsoleToggleButton()
 	{
@@ -1413,6 +1621,14 @@ public class ClientUI
 
 		LoggerContext loggerContext = (LoggerContext) LoggerFactory.getILoggerFactory();
 		consoleLogAppender = ConsoleLogAppender.install(loggerContext, originalOut, consolePanel::append);
+
+		// ===================== [MICROBOT 本地改动] 读回日志显示开关 =====================
+		// 日志等级和类名默认都不显示，勾选状态存在配置里。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		ConsoleLogAppender.setShowLevel(configManager.getConfiguration(CONFIG_GROUP,
+			CONFIG_CLIENT_CONSOLE_SHOW_LEVEL, Boolean.class) == Boolean.TRUE);
+		ConsoleLogAppender.setShowLogger(configManager.getConfiguration(CONFIG_GROUP,
+			CONFIG_CLIENT_CONSOLE_SHOW_LOGGER, Boolean.class) == Boolean.TRUE);
 	}
 
 	private BufferedImage createConsoleIcon(boolean active)
@@ -1480,7 +1696,17 @@ public class ClientUI
 			frame.setOpacity(config.windowOpacity() / 100.0f);
 		}
 
-		if (config.usernameInTitle())
+		// ===================== [MICROBOT 本地改动] --index 自定义窗口标题 =====================
+		// 标题优先级：已应用的 override 标题 > 「标题 + 玩家名」 > 默认标题。
+		// 上游原本只有后两种（if usernameInTitle / else）。
+		// 这一段不能省：否则用户在设置面板改任何一项配置，标题都会被重置回默认。
+		// 上游更新后若此处冲突，保留整个三分支结构即可。
+		// ===================== [MICROBOT 本地改动 END] =====================
+		if (windowTitleOverrideApplied)
+		{
+			frame.setTitle(windowTitleOverride);
+		}
+		else if (!windowTitleOverridden && config.usernameInTitle())
 		{
 			final Client client = (Client) this.client;
 			final Player player = client.getLocalPlayer();
